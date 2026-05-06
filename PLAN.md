@@ -218,10 +218,12 @@ Client executes sequentially via `sh -c` (Unix) / `cmd /C` (Windows), streams st
 - [x] Wire into rathole client's control channel message loop
 - [x] Handle `RunPipeline` (spawn executor), `CancelPipeline` (kill+cleanup)
 
-### Phase 4 — Server CLI
-- [ ] CLI arg parsing with clap: `start`, `list`, `pipeline send`, `pipeline status`
-- [ ] Client registry: track connected clients, their services, and pipeline state
-- [ ] Pipeline dispatch: send YAML to a client via control channel, receive output
+### Phase 4 — Server CLI ✅ DONE
+- [x] CLI arg parsing with clap: `start`, `list`, `pipeline send`
+- [x] Client registry: track connected clients with hostname/OS/arch/pipeline_tx
+- [x] Pipeline dispatch: send YAML/JSON to a client via control channel, stream output back
+- [x] Admin API: local TCP server (JSON-lines) for CLI ↔ server communication
+- [x] Pipeline output printed to server stdout and streamed to admin clients
 
 ### Phase 5 — Tauri client panel
 - [ ] Config editor form (server address, auth token, port mappings)
