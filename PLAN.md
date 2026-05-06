@@ -212,11 +212,11 @@ Client executes sequentially via `sh -c` (Unix) / `cmd /C` (Windows), streams st
 - [x] Add `ServiceType::Http`
 - [x] Wire up encoding/decoding for new message types
 
-### Phase 3 — Pipeline executor (client side)
-- [ ] Implement `pipeline.rs` in kdct-client
-- [ ] Subprocess spawning with output streaming via control channel
-- [ ] Wire into rathole client's control channel message loop
-- [ ] Handle `RunPipeline`, `CancelPipeline` messages
+### Phase 3 — Pipeline executor (client side) ✅ DONE
+- [x] Implement `pipeline.rs` in rathole (fork)
+- [x] Subprocess spawning with output streaming via control channel
+- [x] Wire into rathole client's control channel message loop
+- [x] Handle `RunPipeline` (spawn executor), `CancelPipeline` (kill+cleanup)
 
 ### Phase 4 — Server CLI
 - [ ] CLI arg parsing with clap: `start`, `list`, `pipeline send`, `pipeline status`
