@@ -4,6 +4,7 @@ members = [
     "crates/rathole",
     "crates/kdct-server",
     "crates/kdct-client",
+    "apps/kdct-panel",
 ]
 
 [workspace.package]
