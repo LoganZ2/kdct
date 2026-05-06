@@ -5,9 +5,10 @@ use crate::helper::retry_notify_with_deadline;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
+    self, read_auth, read_control_cmd, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
+use crate::registry::{self, ClientRegistry};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -99,10 +100,15 @@ pub struct Server<T: Transport> {
 
     // `[server.services]` config, indexed by ServiceDigest
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    // Collection of contorl channels
+    // Collection of control channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    // Connected client registry (pub for admin API)
+    pub clients: ClientRegistry,
+    // Pipeline output channel (read by admin layer)
+    pub pipeline_output_rx: mpsc::Receiver<(ServiceDigest, ControlChannelCmd)>,
+    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -123,11 +129,16 @@ impl<T: 'static + Transport> Server<T> {
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
+        let (pipeline_output_tx, pipeline_output_rx) = mpsc::channel(64);
+        let clients = registry::new_registry();
         Ok(Server {
             config,
             services,
             control_channels,
             transport,
+            clients,
+            pipeline_output_rx,
+            pipeline_output_tx,
         })
     }
 
@@ -187,8 +198,10 @@ impl<T: 'static + Transport> Server<T> {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
+                                            let clients = self.clients.clone();
+                                            let pipeline_output_tx = self.pipeline_output_tx.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, clients, pipeline_output_tx).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -252,6 +265,8 @@ async fn handle_connection<T: 'static + Transport>(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    clients: ClientRegistry,
+    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -263,6 +278,8 @@ async fn handle_connection<T: 'static + Transport>(
                 control_channels,
                 service_digest,
                 server_config,
+                clients,
+                pipeline_output_tx,
             )
             .await?;
         }
@@ -279,6 +296,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    clients: ClientRegistry,
+    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -343,7 +362,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
         info!(service = %service_config.name, "Control channel established");
         let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval, clients, service_digest, pipeline_output_tx);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -384,6 +403,8 @@ pub struct ControlChannelHandle<T: Transport> {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
+    /// Send pipeline commands (RunPipeline, CancelPipeline) to this client
+    pub pipeline_tx: mpsc::Sender<ControlChannelCmd>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -397,6 +418,9 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        clients: ClientRegistry,
+        service_digest: ServiceDigest,
+        pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -406,6 +430,10 @@ where
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+
+        // Channel for receiving pipeline commands from admin
+        let (pipeline_tx, pipeline_rx) = mpsc::channel::<ControlChannelCmd>(64);
+        let pipeline_tx_for_registry = pipeline_tx.clone();
 
         // Cache some data channels for later use
         let pool_size = match service.service_type {
@@ -422,6 +450,10 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        let shutdown_tx_clone = shutdown_tx.clone();
+        let digest_for_drop = service_digest;
+        let clients_for_drop = clients.clone();
+
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
                 async move {
@@ -479,6 +511,11 @@ where
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            pipeline_rx,
+            pipeline_tx: pipeline_tx_for_registry,
+            pipeline_output_tx,
+            service_digest: digest_for_drop,
+            clients,
         };
 
         // Run the control channel
@@ -487,6 +524,9 @@ where
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
                 }
+                // Clean up client registry on disconnect
+                let _ = shutdown_tx_clone.send(true);
+                registry::remove(&clients_for_drop, &digest_for_drop).await;
             }
             .instrument(Span::current()),
         );
@@ -495,51 +535,110 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
+            pipeline_tx,
         }
     }
 }
 
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
+// Control channel, using T as the transport layer.
 struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    pipeline_rx: mpsc::Receiver<ControlChannelCmd>, // Receive pipeline commands from admin
+    pipeline_tx: mpsc::Sender<ControlChannelCmd>,   // Clone of handle's pipeline_tx (for registry)
+    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>, // Send output to admin
+    service_digest: ServiceDigest,                 // Identifies this client
+    clients: ClientRegistry,                       // For updating client info
 }
 
 impl<T: Transport> ControlChannel<T> {
-    // Run a control channel
+    // Run a control channel — bidirectional:
+    // - Read ReportStatus / PipelineOutput from client
+    // - Write CreateDataChannel / HeartBeat / RunPipeline / CancelPipeline to client
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        // Wait for data channel requests and the shutdown signal
+        // Split connection for concurrent read/write
+        let (mut rd, wr) = io::split(self.conn);
+        let wr = Arc::new(tokio::sync::Mutex::new(wr));
+
+        // Wait for data channel requests, pipeline commands, and shutdown signal
         loop {
             tokio::select! {
+                // Read commands from the client (ReportStatus, PipelineOutput)
+                val = read_control_cmd(&mut rd) => {
+                    match val {
+                        Ok(ControlChannelCmd::ReportStatus { hostname, os, arch }) => {
+                            info!("Client status: {} {} {}", hostname, os, arch);
+                            registry::upsert(
+                                &self.clients,
+                                self.service_digest,
+                                hostname.clone(),
+                                hostname,
+                                os,
+                                arch,
+                                self.pipeline_tx.clone(),
+                            ).await;
+                        }
+                        Ok(ControlChannelCmd::PipelineOutput { id, step, stdout, stderr, exit_code }) => {
+                            // Forward to admin
+                            let _ = self.pipeline_output_tx.send((
+                                self.service_digest,
+                                ControlChannelCmd::PipelineOutput { id, step, stdout, stderr, exit_code },
+                            )).await;
+                        }
+                        Ok(_) => {
+                            // CreateDataChannel / HeartBeat — client should not send these
+                            debug!("Unexpected control cmd from client");
+                        }
+                        Err(e) => {
+                            debug!("Control channel read error: {:#}", e);
+                            break;
+                        }
+                    }
+                },
+                // Visitor requested → send CreateDataChannel to client
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
+                            let mut guard = wr.lock().await;
                             if let Err(e) = protocol::write_control_cmd(
-                                &mut self.conn,
+                                &mut *guard,
                                 &ControlChannelCmd::CreateDataChannel,
                             ).await {
                                 error!("{:#}", e);
                                 break;
                             }
                         }
-                        None => {
-                            break;
-                        }
+                        None => break,
                     }
                 },
+                // Heartbeat
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
+                    let mut guard = wr.lock().await;
                     if let Err(e) = protocol::write_control_cmd(
-                        &mut self.conn,
+                        &mut *guard,
                         &ControlChannelCmd::HeartBeat,
                     ).await {
                         error!("{:#}", e);
                         break;
                     }
-                }
-                // Wait for the shutdown signal
+                },
+                // Admin pipeline command → forward to client
+                cmd = self.pipeline_rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            let mut guard = wr.lock().await;
+                            if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
+                                error!("{:#}", e);
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                },
+                // Shutdown signal
                 _ = self.shutdown_rx.recv() => {
                     break;
                 }

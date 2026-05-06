@@ -6,6 +6,7 @@ pub mod helper;
 pub mod multi_map;
 pub mod pipeline;
 pub mod protocol;
+pub mod registry;
 pub mod transport;
 
 pub use cli::Cli;
