@@ -2,7 +2,6 @@ pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,6 +14,26 @@ const PROTO_V1: u8 = 1u8;
 pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
+
+// ── Pipeline types ──────────────────────────────────────────────
+
+/// Unique identifier for a pipeline run
+pub type PipelineId = String;
+
+/// A single step in a pipeline
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct PipelineStep {
+    /// Human-readable step name (e.g., "install", "build")
+    pub name: String,
+    /// Shell command to execute
+    pub command: String,
+    /// Working directory (defaults to current dir if None)
+    pub cwd: Option<String>,
+    /// Timeout in seconds (0 = no timeout)
+    pub timeout_secs: u64,
+}
+
+// ── Wire message types ──────────────────────────────────────────
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
@@ -50,13 +69,43 @@ impl std::fmt::Display for Ack {
 pub enum ControlChannelCmd {
     CreateDataChannel,
     HeartBeat,
+    /// Server → Client: Execute a pipeline
+    RunPipeline {
+        id: PipelineId,
+        steps: Vec<PipelineStep>,
+    },
+    /// Server → Client: Cancel a running pipeline
+    CancelPipeline {
+        id: PipelineId,
+    },
+    /// Client → Server: Streaming output from a pipeline step
+    PipelineOutput {
+        id: PipelineId,
+        step: String,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: Option<i32>,
+    },
+    /// Client → Server: Client info reported on connect
+    ReportStatus {
+        hostname: String,
+        os: String,
+        arch: String,
+    },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
     StartForwardTcp,
     StartForwardUdp,
+    /// Start HTTP forwarding with optional host/path routing
+    StartForwardHttp {
+        path_prefix: Option<String>,
+        host: Option<String>,
+    },
 }
+
+// ── UDP traffic (unchanged wire format) ─────────────────────────
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
 #[derive(Deserialize, Serialize, Debug)]
@@ -134,65 +183,32 @@ impl UdpTraffic {
     }
 }
 
+// ── Hashing ─────────────────────────────────────────────────────
+
 pub fn digest(data: &[u8]) -> Digest {
     use sha2::{Digest, Sha256};
     let d = Sha256::new().chain_update(data).finalize();
     d.into()
 }
 
-struct PacketLength {
-    hello: usize,
-    ack: usize,
-    auth: usize,
-    c_cmd: usize,
-    d_cmd: usize,
-}
+// ── Length-prefixed read helpers ────────────────────────────────
 
-impl PacketLength {
-    pub fn new() -> PacketLength {
-        let username = "default";
-        let d = digest(username.as_bytes());
-        let hello = bincode::serialized_size(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
-            .unwrap() as usize;
-        let c_cmd =
-            bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
-        let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
-        let ack = Ack::Ok;
-        let ack = bincode::serialized_size(&ack).unwrap() as usize;
-
-        let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
-        PacketLength {
-            hello,
-            ack,
-            auth,
-            c_cmd,
-            d_cmd,
-        }
-    }
-}
-
-lazy_static! {
-    static ref PACKET_LEN: PacketLength = PacketLength::new();
+async fn read_len_prefixed<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Vec<u8>> {
+    let len = conn.read_u16().await.context("Failed to read length prefix")? as usize;
+    let mut buf = vec![0u8; len];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| format!("Failed to read {} bytes", len))?;
+    Ok(buf)
 }
 
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
-    let mut buf = vec![0u8; PACKET_LEN.hello];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read hello")?;
-    let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
+    let buf = read_len_prefixed(conn).await?;
+    let hello: Hello =
+        bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
 
     match hello {
-        Hello::ControlChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
-            }
-        }
-        Hello::DataChannelHello(v, _) => {
+        Hello::ControlChannelHello(v, _) | Hello::DataChannelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
@@ -207,37 +223,65 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
 }
 
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
-    let mut buf = vec![0u8; PACKET_LEN.auth];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read auth")?;
+    let buf = read_len_prefixed(conn).await?;
     bincode::deserialize(&buf).with_context(|| "Failed to deserialize auth")
 }
 
 pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
-    let mut bytes = vec![0u8; PACKET_LEN.ack];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read ack")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
+    let buf = read_len_prefixed(conn).await?;
+    bincode::deserialize(&buf).with_context(|| "Failed to deserialize ack")
 }
 
 pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<ControlChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.c_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
+    let buf = read_len_prefixed(conn).await?;
+    bincode::deserialize(&buf).with_context(|| "Failed to deserialize control cmd")
 }
 
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+    let buf = read_len_prefixed(conn).await?;
+    bincode::deserialize(&buf).with_context(|| "Failed to deserialize data cmd")
+}
+
+// ── Length-prefixed write helpers ───────────────────────────────
+
+async fn write_len_prefixed<T: AsyncWrite + Unpin>(conn: &mut T, payload: &[u8]) -> Result<()> {
+    conn.write_u16(payload.len() as u16).await?;
+    conn.write_all(payload).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+pub async fn write_hello<T: AsyncWrite + Unpin>(conn: &mut T, hello: &Hello) -> Result<()> {
+    let payload = bincode::serialize(hello).context("Failed to serialize hello")?;
+    write_len_prefixed(conn, &payload).await
+}
+
+pub async fn write_auth<T: AsyncWrite + Unpin>(conn: &mut T, auth: &Auth) -> Result<()> {
+    let payload = bincode::serialize(auth).context("Failed to serialize auth")?;
+    write_len_prefixed(conn, &payload).await
+}
+
+pub async fn write_ack<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ack) -> Result<()> {
+    let payload = bincode::serialize(ack).context("Failed to serialize ack")?;
+    write_len_prefixed(conn, &payload).await
+}
+
+pub async fn write_control_cmd<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    cmd: &ControlChannelCmd,
+) -> Result<()> {
+    let payload = bincode::serialize(cmd).context("Failed to serialize control cmd")?;
+    write_len_prefixed(conn, &payload).await
+}
+
+pub async fn write_data_cmd<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    cmd: &DataChannelCmd,
+) -> Result<()> {
+    let payload = bincode::serialize(cmd).context("Failed to serialize data cmd")?;
+    write_len_prefixed(conn, &payload).await
 }

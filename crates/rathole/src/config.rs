@@ -86,6 +86,8 @@ pub enum ServiceType {
     Tcp,
     #[serde(rename = "udp")]
     Udp,
+    #[serde(rename = "http")]
+    Http,
 }
 
 fn default_service_type() -> ServiceType {

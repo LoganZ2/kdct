@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::helper::retry_notify_with_deadline;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -17,7 +17,7 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
@@ -293,16 +293,13 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         protocol::CURRENT_PROTO_VERSION,
         nonce.clone().try_into().unwrap(),
     );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
-        .await?;
-    conn.flush().await?;
+    protocol::write_hello(&mut conn, &hello_send).await?;
 
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
-                .await?;
+            protocol::write_ack(&mut conn, &Ack::ServiceNotExist).await?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
     }
@@ -320,8 +317,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
-            .await?;
+        protocol::write_ack(&mut conn, &Ack::AuthFailed).await?;
         debug!(
             "Expect {}, but got {}",
             hex::encode(session_key),
@@ -343,9 +339,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         }
 
         // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
-        conn.flush().await?;
+        protocol::write_ack(&mut conn, &Ack::Ok).await?;
 
         info!(service = %service_config.name, "Control channel established");
         let handle =
@@ -417,6 +411,7 @@ where
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
+            ServiceType::Http => TCP_POOL_SIZE, // HTTP runs over TCP
         };
 
         for _i in 0..pool_size {
@@ -460,6 +455,22 @@ where
                 }
                 .instrument(Span::current()),
             ),
+            ServiceType::Http => tokio::spawn(
+                async move {
+                    if let Err(e) = run_tcp_connection_pool::<T>(
+                        bind_addr,
+                        data_ch_rx,
+                        data_ch_req_tx,
+                        shutdown_rx_clone,
+                    )
+                    .await
+                    .with_context(|| "Failed to run HTTP connection pool")
+                    {
+                        error!("{:#}", e);
+                    }
+                }
+                .instrument(Span::current()),
+            ),
         };
 
         // Create the control channel
@@ -497,25 +508,19 @@ struct ControlChannel<T: Transport> {
 }
 
 impl<T: Transport> ControlChannel<T> {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
-
         // Wait for data channel requests and the shutdown signal
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
+                            if let Err(e) = protocol::write_control_cmd(
+                                &mut self.conn,
+                                &ControlChannelCmd::CreateDataChannel,
+                            ).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -526,10 +531,13 @@ impl<T: Transport> ControlChannel<T> {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
-                                error!("{:#}", e);
-                                break;
-                            }
+                    if let Err(e) = protocol::write_control_cmd(
+                        &mut self.conn,
+                        &ControlChannelCmd::HeartBeat,
+                    ).await {
+                        error!("{:#}", e);
+                        break;
+                    }
                 }
                 // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {
@@ -630,12 +638,11 @@ async fn run_tcp_connection_pool<T: Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
-                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                if protocol::write_data_cmd(&mut ch, &DataChannelCmd::StartForwardTcp).await.is_ok() {
                     tokio::spawn(async move {
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });
@@ -678,14 +685,12 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
-
     // Receive one data channel
     let mut conn = data_ch_rx
         .recv()
         .await
         .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
+    protocol::write_data_cmd(&mut conn, &DataChannelCmd::StartForwardUdp).await?;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {

@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -205,8 +205,7 @@ async fn do_data_channel_handshake<T: Transport>(
     // Send nonce
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
-    conn.flush().await?;
+    protocol::write_hello(&mut conn, &hello).await?;
 
     Ok(conn)
 }
@@ -228,6 +227,10 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
             run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+        }
+        DataChannelCmd::StartForwardHttp { .. } => {
+            // TODO: Phase 6 — HTTP forwarding with host/path routing
+            bail!("HTTP forwarding not yet implemented (Phase 6)");
         }
     }
     Ok(())
@@ -417,9 +420,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Sending hello");
         let hello_send =
             Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&bincode::serialize(&hello_send).unwrap())
-            .await?;
-        conn.flush().await?;
+        protocol::write_hello(&mut conn, &hello_send).await?;
 
         // Read hello
         debug!("Reading hello");
@@ -437,8 +438,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         let session_key = protocol::digest(&concat);
         let auth = Auth(session_key);
-        conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
-        conn.flush().await?;
+        protocol::write_auth(&mut conn, &auth).await?;
 
         // Read ack
         debug!("Reading ack");
@@ -477,7 +477,23 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                 }
                             }.instrument(Span::current()));
                         },
-                        ControlChannelCmd::HeartBeat => ()
+                        ControlChannelCmd::HeartBeat => (),
+                        ControlChannelCmd::RunPipeline { id, steps } => {
+                            info!("Received pipeline: {} with {} steps", id, steps.len());
+                            // TODO: Phase 3 — dispatch to pipeline executor
+                            warn!("Pipeline execution not yet implemented (Phase 3)");
+                        }
+                        ControlChannelCmd::CancelPipeline { id } => {
+                            info!("Received cancel for pipeline: {}", id);
+                            // TODO: Phase 3 — signal pipeline executor to cancel
+                            warn!("Pipeline cancellation not yet implemented (Phase 3)");
+                        }
+                        ControlChannelCmd::PipelineOutput { .. } => {
+                            warn!("Client received unexpected PipelineOutput (client→server message)");
+                        }
+                        ControlChannelCmd::ReportStatus { .. } => {
+                            warn!("Client received unexpected ReportStatus (client→server message)");
+                        }
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
