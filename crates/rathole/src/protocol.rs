@@ -202,7 +202,7 @@ async fn read_len_prefixed<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Vec<u8>
     Ok(buf)
 }
 
-pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
+pub async fn read_hello<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Hello> {
     let buf = read_len_prefixed(conn).await?;
     let hello: Hello =
         bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
@@ -222,24 +222,24 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     Ok(hello)
 }
 
-pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
+pub async fn read_auth<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Auth> {
     let buf = read_len_prefixed(conn).await?;
     bincode::deserialize(&buf).with_context(|| "Failed to deserialize auth")
 }
 
-pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
+pub async fn read_ack<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Ack> {
     let buf = read_len_prefixed(conn).await?;
     bincode::deserialize(&buf).with_context(|| "Failed to deserialize ack")
 }
 
-pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
+pub async fn read_control_cmd<T: AsyncRead + Unpin>(
     conn: &mut T,
 ) -> Result<ControlChannelCmd> {
     let buf = read_len_prefixed(conn).await?;
     bincode::deserialize(&buf).with_context(|| "Failed to deserialize control cmd")
 }
 
-pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
+pub async fn read_data_cmd<T: AsyncRead + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {
     let buf = read_len_prefixed(conn).await?;

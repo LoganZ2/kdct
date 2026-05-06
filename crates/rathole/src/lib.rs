@@ -4,6 +4,7 @@ pub mod config_watcher;
 pub mod constants;
 pub mod helper;
 pub mod multi_map;
+pub mod pipeline;
 pub mod protocol;
 pub mod transport;
 

@@ -453,6 +453,27 @@ impl<T: 'static + Transport> ControlChannel<T> {
         // Channel ready
         info!("Control channel established");
 
+        // Split connection so we can read commands and write pipeline output concurrently
+        let (mut rd, wr) = io::split(conn);
+        let wr = Arc::new(tokio::sync::Mutex::new(wr));
+
+        // Pipeline output channel: pipeline tasks send here, forwarder writes to server
+        let (pipeline_tx, mut pipeline_rx) = mpsc::channel::<ControlChannelCmd>(64);
+
+        // Spawn forwarder: reads from pipeline_rx, writes length-prefixed to server
+        {
+            let wr = wr.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = pipeline_rx.recv().await {
+                    let mut guard = wr.lock().await;
+                    if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
+                        error!("Failed to send pipeline output: {:#}", e);
+                        break;
+                    }
+                }
+            });
+        }
+
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
         let data_ch_args = Arc::new(RunDataChannelArgs {
@@ -465,9 +486,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         loop {
             tokio::select! {
-                val = read_control_cmd(&mut conn) => {
+                val = read_control_cmd(&mut rd) => {
                     let val = val?;
-                    debug!( "Received {:?}", val);
+                    debug!("Received {:?}", val);
                     match val {
                         ControlChannelCmd::CreateDataChannel => {
                             let args = data_ch_args.clone();
@@ -479,14 +500,15 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         },
                         ControlChannelCmd::HeartBeat => (),
                         ControlChannelCmd::RunPipeline { id, steps } => {
-                            info!("Received pipeline: {} with {} steps", id, steps.len());
-                            // TODO: Phase 3 — dispatch to pipeline executor
-                            warn!("Pipeline execution not yet implemented (Phase 3)");
+                            let tx = pipeline_tx.clone();
+                            tokio::spawn(async move {
+                                crate::pipeline::execute(id, steps, tx).await;
+                            }.instrument(Span::current()));
                         }
                         ControlChannelCmd::CancelPipeline { id } => {
-                            info!("Received cancel for pipeline: {}", id);
-                            // TODO: Phase 3 — signal pipeline executor to cancel
-                            warn!("Pipeline cancellation not yet implemented (Phase 3)");
+                            tokio::spawn(async move {
+                                crate::pipeline::cancel(&id).await;
+                            });
                         }
                         ControlChannelCmd::PipelineOutput { .. } => {
                             warn!("Client received unexpected PipelineOutput (client→server message)");
