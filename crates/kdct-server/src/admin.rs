@@ -6,6 +6,7 @@
 use rathole::protocol::{ControlChannelCmd, PipelineStep};
 use rathole::registry::ClientRegistry;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,8 +39,8 @@ pub enum AdminResponse {
     PipelineOutput {
         id: String,
         step: String,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: String,
+        stderr: String,
         exit_code: Option<i32>,
     },
     #[serde(rename = "error")]
@@ -64,6 +65,8 @@ pub async fn run_admin(
     registry: ClientRegistry,
     mut pipeline_output_rx: mpsc::Receiver<(rathole::protocol::Digest, ControlChannelCmd)>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<bool>,
+    web_output_buf: Option<Arc<RwLock<Vec<String>>>>,
+    log_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use tracing::{error, info, warn};
 
@@ -74,15 +77,16 @@ pub async fn run_admin(
     info!("Admin API listening on {}", addr);
 
     let registry = Arc::new(registry);
+    let registry_for_log = registry.clone();
 
     // Subscribers for pipeline output streaming
     let output_subscribers: Subscribers = Arc::new(RwLock::new(Vec::new()));
 
-    // Forward pipeline output to server stdout AND all subscribers
+    // Forward pipeline output to server stdout AND all subscribers AND web buffer AND log files
     {
         let subscribers = output_subscribers.clone();
         tokio::spawn(async move {
-            while let Some((_digest, cmd)) = pipeline_output_rx.recv().await {
+            while let Some((digest, cmd)) = pipeline_output_rx.recv().await {
                 if let ControlChannelCmd::PipelineOutput {
                     id,
                     step,
@@ -91,24 +95,65 @@ pub async fn run_admin(
                     exit_code,
                 } = cmd
                 {
-                    if !stdout.is_empty() {
-                        print!("{}", String::from_utf8_lossy(&stdout));
+                    let stdout_str = String::from_utf8_lossy(&stdout).into_owned();
+                    let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+
+                    if !stdout_str.is_empty() {
+                        print!("{}", stdout_str);
                     }
-                    if !stderr.is_empty() {
-                        eprint!("{}", String::from_utf8_lossy(&stderr));
+                    if !stderr_str.is_empty() {
+                        eprint!("{}", stderr_str);
+                    }
+
+                    // Write to per-client log file
+                    if let Some(ref dir) = log_dir {
+                        let client_name = registry_for_log.read().await
+                            .get(&digest)
+                            .map(|e| e.service_name.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let log_path = dir.join(format!("{}.log", client_name));
+                        // Format: [HH:MM:SS] [step] output
+                        let now = {
+                            let t = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default();
+                            let secs = t.as_secs();
+                            format!("{:02}:{:02}:{:02}", (secs/3600)%24, (secs/60)%60, secs%60)
+                        };
+                        let mut entry = String::new();
+                        if !stdout_str.is_empty() {
+                            entry.push_str(&format!("[{}] [{}] {}\n", now, step, stdout_str.trim_end()));
+                        }
+                        if !stderr_str.is_empty() {
+                            entry.push_str(&format!("[{}] [{}] [stderr] {}\n", now, step, stderr_str.trim_end()));
+                        }
+                        if let Some(code) = exit_code {
+                            entry.push_str(&format!("[{}] [{}] exit={}\n", now, step, code));
+                        }
+                        if !entry.is_empty() {
+                            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                                .create(true).append(true).open(&log_path).await
+                            {
+                                let _ = tokio::io::AsyncWriteExt::write_all(&mut f, entry.as_bytes()).await;
+                            }
+                        }
                     }
 
                     let resp = AdminResponse::PipelineOutput {
                         id,
                         step,
-                        stdout,
-                        stderr,
+                        stdout: stdout_str,
+                        stderr: stderr_str,
                         exit_code,
                     };
                     if let Ok(json) = serde_json::to_string(&resp) {
                         let line = json + "\n";
                         for tx in subscribers.read().await.iter() {
                             let _ = tx.send(line.clone());
+                        }
+                        // Also write to web output buffer
+                        if let Some(ref buf) = web_output_buf {
+                            buf.write().await.push(line);
                         }
                     }
                 }
@@ -300,10 +345,10 @@ pub async fn admin_request(port: u16, cmd_json: &str) -> anyhow::Result<()> {
                     exit_code,
                 } => {
                     if !stdout.is_empty() {
-                        print!("{}", String::from_utf8_lossy(&stdout));
+                        print!("{}", stdout);
                     }
                     if !stderr.is_empty() {
-                        eprint!("{}", String::from_utf8_lossy(&stderr));
+                        eprint!("{}", stderr);
                     }
                     if let Some(code) = exit_code {
                         println!("\n--- Step '{}' finished (exit: {}) ---", step, code);

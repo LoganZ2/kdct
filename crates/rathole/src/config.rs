@@ -207,7 +207,7 @@ fn default_client_retry_interval() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub remote_addr: String,
-    pub default_token: Option<MaskedString>,
+    pub default_token: MaskedString,
     pub prefer_ipv6: Option<bool>,
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
@@ -226,15 +226,16 @@ fn default_heartbeat_interval() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub default_token: Option<MaskedString>,
+    pub default_token: MaskedString,
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
     /// Port pool for auto-assignment (e.g. "9000-9999")
-    #[serde(default)]
-    pub port_pool: Option<String>,
+    pub port_pool: String,
+    /// Web dashboard port
+    pub web_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -268,10 +269,7 @@ impl Config {
         for (name, s) in &mut server.services {
             s.name = name.clone();
             if s.token.is_none() {
-                s.token = server.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
+                s.token = Some(server.default_token.clone());
             }
         }
 
@@ -285,10 +283,7 @@ impl Config {
         for (name, s) in &mut client.services {
             s.name = name.clone();
             if s.token.is_none() {
-                s.token = client.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
+                s.token = Some(client.default_token.clone());
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);

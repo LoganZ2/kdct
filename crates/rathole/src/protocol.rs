@@ -30,6 +30,7 @@ pub struct PipelineStep {
     /// Working directory (defaults to current dir if None)
     pub cwd: Option<String>,
     /// Timeout in seconds (0 = no timeout)
+    #[serde(default)]
     pub timeout_secs: u64,
 }
 

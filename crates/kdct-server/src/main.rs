@@ -1,4 +1,5 @@
 mod admin;
+mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -98,27 +99,45 @@ async fn start_server(config_path: PathBuf, admin_port: u16) -> Result<()> {
         .server
         .ok_or_else(|| anyhow::anyhow!("Missing [server] section in config"))?;
 
+    let web_port = server_config.web_port;
+
     // Only TCP transport is supported out-of-the-box.
     // For TLS/Noise/WebSocket, compile rathole with the appropriate features.
     match server_config.transport.transport_type {
         TransportType::Tcp => {
-            let pool = if let Some(ref range) = server_config.port_pool {
-                Some(rathole::port_pool::PortPool::new(range).await?)
-            } else {
-                None
-            };
-            let mut server = Server::<TcpTransport>::from(server_config, pool).await?;
+            let pool = rathole::port_pool::PortPool::new(&server_config.port_pool).await?;
+            let mut server = Server::<TcpTransport>::from(server_config, Some(pool)).await?;
             let clients = server.clients.clone();
             let rx = std::mem::replace(
                 &mut server.pipeline_output_rx,
                 tokio::sync::mpsc::channel(1).1,
             );
 
+            // Log directory for per-client persistent logs
+            let log_dir = std::path::PathBuf::from("./logs");
+            tokio::fs::create_dir_all(&log_dir).await?;
+
             let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
+
+            // Admin TCP API
             let admin_shutdown = shutdown_tx.subscribe();
+            let admin_clients = clients.clone();
+            let admin_log_dir = log_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = admin::run_admin(admin_port, clients, rx, admin_shutdown).await {
+                if let Err(e) =
+                    admin::run_admin(admin_port, admin_clients, rx, admin_shutdown, None, Some(admin_log_dir))
+                        .await
+                {
                     tracing::error!("Admin server error: {:#}", e);
+                }
+            });
+
+            // Web dashboard (always on)
+            let web_clients = clients.clone();
+            let web_log_dir = log_dir.clone();
+            tokio::spawn(async move {
+                if let Err(e) = web::run_web(web_port, web_clients, web_log_dir).await {
+                    tracing::error!("Web server error: {:#}", e);
                 }
             });
 
