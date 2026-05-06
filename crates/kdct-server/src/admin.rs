@@ -287,6 +287,7 @@ pub async fn admin_request(port: u16, cmd_json: &str) -> anyhow::Result<()> {
                             println!("{:<20} {:<20} {:<12} {:<8} {:?}", c.name, c.hostname, c.os, c.arch, c.ports);
                         }
                     }
+                    break;
                 }
                 AdminResponse::PipelineSent { id } => {
                     println!("Pipeline {} dispatched. Streaming output:\n", id);
