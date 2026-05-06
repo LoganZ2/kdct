@@ -14,3 +14,6 @@
 # Original rathole clone (forked into crates/rathole/)
 /rathole/
 
+# Internal docs
+PLAN.md
+
