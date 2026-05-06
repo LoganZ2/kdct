@@ -1,0 +1,5 @@
+[
+  {"name": "hello", "command": "echo 'Hello from pipeline'"},
+  {"name": "pwd", "command": "pwd"},
+  {"name": "env_check", "command": "echo OS=$OSTYPE"}
+]

@@ -1,0 +1,11 @@
+[client]
+remote_addr = "127.0.0.1:2334"
+default_token = "test-token"
+
+[client.transport]
+type = "tcp"
+
+[client.services.web]
+type = "tcp"
+local_addr = "127.0.0.1:8888"
+token = "test-token"

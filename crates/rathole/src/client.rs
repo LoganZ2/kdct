@@ -457,6 +457,26 @@ impl<T: 'static + Transport> ControlChannel<T> {
         let (mut rd, wr) = io::split(conn);
         let wr = Arc::new(tokio::sync::Mutex::new(wr));
 
+        // Send ReportStatus to register with the server
+        {
+            let hostname = get_hostname();
+            let os = std::env::consts::OS.to_string();
+            let arch = std::env::consts::ARCH.to_string();
+            let mut guard = wr.lock().await;
+            if let Err(e) = protocol::write_control_cmd(
+                &mut *guard,
+                &ControlChannelCmd::ReportStatus {
+                    hostname,
+                    os,
+                    arch,
+                },
+            )
+            .await
+            {
+                warn!("Failed to send ReportStatus: {:#}", e);
+            }
+        }
+
         // Pipeline output channel: pipeline tasks send here, forwarder writes to server
         let (pipeline_tx, mut pipeline_rx) = mpsc::channel::<ControlChannelCmd>(64);
 
@@ -595,4 +615,16 @@ impl ControlChannelHandle {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
     }
+}
+
+/// Get the machine hostname (cross-platform).
+fn get_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_else(|_| "unknown".to_string())
 }

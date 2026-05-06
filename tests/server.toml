@@ -1,0 +1,11 @@
+[server]
+bind_addr = "0.0.0.0:2334"
+default_token = "test-token"
+
+[server.transport]
+type = "tcp"
+
+[server.services.web]
+type = "tcp"
+bind_addr = "0.0.0.0:9999"
+token = "test-token"
