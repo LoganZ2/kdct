@@ -52,6 +52,7 @@ pub struct ClientInfo {
     pub hostname: String,
     pub os: String,
     pub arch: String,
+    pub ports: Vec<String>,
 }
 
 type Subscribers = Arc<RwLock<Vec<mpsc::UnboundedSender<String>>>>;
@@ -172,6 +173,7 @@ async fn handle_admin_conn(
                         hostname: e.hostname.clone(),
                         os: e.os.clone(),
                         arch: e.arch.clone(),
+                        ports: e.ports.clone(),
                     })
                     .collect();
                 drop(guard);
@@ -280,9 +282,9 @@ pub async fn admin_request(port: u16, cmd_json: &str) -> anyhow::Result<()> {
                     if data.is_empty() {
                         println!("No connected clients.");
                     } else {
-                        println!("{:<20} {:<20} {:<12} {}", "NAME", "HOSTNAME", "OS", "ARCH");
+                        println!("{:<20} {:<20} {:<12} {:<8} {}", "NAME", "HOSTNAME", "OS", "ARCH", "PORTS");
                         for c in &data {
-                            println!("{:<20} {:<20} {:<12} {}", c.name, c.hostname, c.os, c.arch);
+                            println!("{:<20} {:<20} {:<12} {:<8} {:?}", c.name, c.hostname, c.os, c.arch, c.ports);
                         }
                     }
                 }
