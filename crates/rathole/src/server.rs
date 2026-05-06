@@ -15,12 +15,12 @@ use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -411,6 +411,8 @@ pub struct ControlChannelHandle<T: Transport> {
     service: ServerServiceConfig,
     /// Send pipeline commands (RunPipeline, CancelPipeline) to this client
     pub pipeline_tx: mpsc::Sender<ControlChannelCmd>,
+    /// For port-pool assigned ports: pending data channel requests
+    port_data_pending: Arc<RwLock<std::collections::VecDeque<(tokio::sync::oneshot::Sender<T::Stream>, u16)>>>,
 }
 
 impl<T> ControlChannelHandle<T>
@@ -511,6 +513,8 @@ where
             ),
         };
 
+        let port_data_pending = Arc::new(RwLock::new(VecDeque::new()));
+
         // Create the control channel
         let ch = ControlChannel::<T> {
             conn,
@@ -522,6 +526,7 @@ where
             pipeline_output_tx,
             service_digest: digest_for_drop,
             clients,
+            port_data_pending: port_data_pending.clone(),
         };
 
         // Run the control channel
@@ -542,6 +547,7 @@ where
             data_ch_tx,
             service,
             pipeline_tx,
+            port_data_pending,
         }
     }
 }
@@ -557,6 +563,7 @@ struct ControlChannel<T: Transport> {
     pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>, // Send output to admin
     service_digest: ServiceDigest,                 // Identifies this client
     clients: ClientRegistry,                       // For updating client info
+    port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>, // Port-pool pending data channels
 }
 
 impl<T: Transport> ControlChannel<T> {
