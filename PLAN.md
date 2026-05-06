@@ -50,11 +50,10 @@ rathole (`crates/rathole/`) is a pure-Rust frp alternative:
 │           ├── main.rs                 # Parse args, init rathole client
 │           └── pipeline.rs            # Pipeline executor (subprocess manager)
 └── apps/
-    └── kdct-panel/                     # Tauri v2 app (client config UI)
-        ├── src/                        # Svelte frontend
-        └── src-tauri/
-            ├── Cargo.toml
-            └── src/lib.rs              # Tauri commands
+    └── kdct-panel/                     # System tray app
+        ├── Cargo.toml
+        └── src/
+            └── main.rs                 # tray-icon + muda + rathole client
 ```
 
 ## What We Change in rathole
@@ -128,11 +127,11 @@ New module: pipeline execution engine that:
 - On startup: reports hostname, OS, arch via `ReportStatus`
 - Sits in the background, maintains tunnel, waits for pipelines
 
-### kdct-panel — Tauri app (client-side GUI)
+### kdct-panel — System tray app
 
-- Simple config UI for editing client config.toml
-- Start/stop the client daemon
-- Show connection status
+- Pure Rust tray icon (green=connected, red=disconnected)
+- Right-click menu: Start/Stop client, Edit Config, Quit
+- Opens config in system default text editor
 
 ## Pipeline Design
 
@@ -225,10 +224,12 @@ Client executes sequentially via `sh -c` (Unix) / `cmd /C` (Windows), streams st
 - [x] Admin API: local TCP server (JSON-lines) for CLI ↔ server communication
 - [x] Pipeline output printed to server stdout and streamed to admin clients
 
-### Phase 5 — Tauri client panel
-- [ ] Config editor form (server address, auth token, port mappings)
-- [ ] Start/stop client daemon
-- [ ] Connection status indicator
+### Phase 5 — System tray client panel ✅ DONE
+- [x] Pure Rust system tray (tray-icon + muda) — no Tauri/Electron overhead
+- [x] Green/red icon for connection status
+- [x] Right-click menu: Start Client, Stop Client, Edit Config, Quit
+- [x] Background tokio thread runs rathole client
+- [x] Config at ~/.config/kdct/kdct-client.toml, opens in default editor
 
 ### Phase 6 — HTTP reverse proxy (post-MVP if needed)
 - [ ] `StartForwardHttp` data channel command
