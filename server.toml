@@ -1,0 +1,9 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "test-token-123"
+port_pool = "9000-9999"
+domain = "localhost"
+http_port = 8080
+
+[server.transport]
+type = "tcp"

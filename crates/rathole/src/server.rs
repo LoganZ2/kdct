@@ -31,15 +31,14 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-type ServiceDigest = protocol::Digest; // SHA256 of a service name
-type Nonce = protocol::Digest; // Also called `session_key`
+type ServiceDigest = protocol::Digest;
+type Nonce = protocol::Digest;
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
-const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
-const CHAN_SIZE: usize = 2048; // The capacity of various chans
-const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+const TCP_POOL_SIZE: usize = 8;
+const UDP_POOL_SIZE: usize = 2;
+const CHAN_SIZE: usize = 2048;
+const HANDSHAKE_TIMEOUT: u64 = 5;
 
-// The entrypoint of running a server
 pub async fn run_server(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -54,13 +53,15 @@ pub async fn run_server(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config, None).await?;
+            let (node_update_tx, _) = mpsc::channel(1024);
+            let mut server = Server::<TcpTransport>::from(config, None, node_update_tx).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config, None).await?;
+                let (node_update_tx, _) = mpsc::channel(1024);
+                let mut server = Server::<TlsTransport>::from(config, None, node_update_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -69,7 +70,8 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config, None).await?;
+                let (node_update_tx, _) = mpsc::channel(1024);
+                let mut server = Server::<NoiseTransport>::from(config, None, node_update_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -78,7 +80,8 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config, None).await?;
+                let (node_update_tx, _) = mpsc::channel(1024);
+                let mut server = Server::<WebsocketTransport>::from(config, None, node_update_tx).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -89,31 +92,18 @@ pub async fn run_server(
     Ok(())
 }
 
-// A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
-// See also MultiMap
 type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
 
-// Server holds all states of running a server
 pub struct Server<T: Transport> {
-    // `[server]` config
     config: Arc<ServerConfig>,
-
-    // `[server.services]` config, indexed by ServiceDigest
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    // Collection of control channels
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
-    // Wrapper around the transport layer
     transport: Arc<T>,
-    // Connected client registry (pub for admin API)
     pub clients: ClientRegistry,
-    // Port pool for auto-assignment
     pub port_pool: Option<Arc<crate::port_pool::PortPool>>,
-    // Pipeline output channel (read by admin layer)
-    pub pipeline_output_rx: mpsc::Receiver<(ServiceDigest, ControlChannelCmd)>,
-    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
+    pub node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
 }
 
-// Generate a hash map of services which is indexed by ServiceDigest
 fn generate_service_hashmap(
     server_config: &ServerConfig,
 ) -> HashMap<ServiceDigest, ServerServiceConfig> {
@@ -125,16 +115,15 @@ fn generate_service_hashmap(
 }
 
 impl<T: 'static + Transport> Server<T> {
-    // Create a server from `[server]`
     pub async fn from(
         config: ServerConfig,
         port_pool: Option<Arc<crate::port_pool::PortPool>>,
+        node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
     ) -> Result<Server<T>> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
-        let (pipeline_output_tx, pipeline_output_rx) = mpsc::channel(64);
         let clients = registry::new_registry();
         Ok(Server {
             config,
@@ -143,18 +132,15 @@ impl<T: 'static + Transport> Server<T> {
             transport,
             clients,
             port_pool,
-            pipeline_output_rx,
-            pipeline_output_tx,
+            node_update_tx,
         })
     }
 
-    // The entry point of Server
     pub async fn run(
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
-        // Listen at `server.bind_addr`
         let l = self
             .transport
             .bind(&self.config.bind_addr)
@@ -162,41 +148,30 @@ impl<T: 'static + Transport> Server<T> {
             .with_context(|| "Failed to listen at `server.bind_addr`")?;
         info!("Listening at {}", self.config.bind_addr);
 
-        // Retry at least every 100ms
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_millis(100),
             max_elapsed_time: None,
             ..Default::default()
         };
 
-        // Wait for connections and shutdown signals
         loop {
             tokio::select! {
-                // Wait for incoming control and data channels
                 ret = self.transport.accept(&l) => {
                     match ret {
                         Err(err) => {
-                            // Detects whether it's an IO error
                             if let Some(err) = err.downcast_ref::<io::Error>() {
-                                // If it is an IO error, then it's possibly an
-                                // EMFILE. So sleep for a while and retry
-                                // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
                                 if let Some(d) = backoff.next_backoff() {
                                     error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
                                     time::sleep(d).await;
                                 } else {
-                                    // This branch will never be executed according to the current retry policy
                                     error!("Too many retries. Aborting...");
                                     break;
                                 }
                             }
-                            // If it's not an IO error, then it comes from
-                            // the transport layer, so just ignore it
                         }
                         Ok((conn, addr)) => {
                             backoff.reset();
 
-                            // Do transport handshake with a timeout
                             match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
                                 Ok(conn) => {
                                     match conn.with_context(|| "Failed to do transport handshake") {
@@ -205,10 +180,10 @@ impl<T: 'static + Transport> Server<T> {
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
                                             let clients = self.clients.clone();
-                                            let pipeline_output_tx = self.pipeline_output_tx.clone();
                                             let port_pool = self.port_pool.clone();
+                                            let node_update_tx = self.node_update_tx.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, clients, pipeline_output_tx, port_pool).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, clients, port_pool, node_update_tx).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -224,7 +199,6 @@ impl<T: 'static + Transport> Server<T> {
                         }
                     }
                 },
-                // Wait for the shutdown signal
                 _ = shutdown_rx.recv() => {
                     info!("Shuting down gracefully...");
                     break;
@@ -266,17 +240,15 @@ impl<T: 'static + Transport> Server<T> {
     }
 }
 
-// Handle connections to `server.bind_addr`
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
     clients: ClientRegistry,
-    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
     port_pool: Option<Arc<crate::port_pool::PortPool>>,
+    node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
 ) -> Result<()> {
-    // Read hello
     let hello = read_hello(&mut conn).await?;
     match hello {
         ControlChannelHello(_, service_digest) => {
@@ -287,8 +259,8 @@ async fn handle_connection<T: 'static + Transport>(
                 service_digest,
                 server_config,
                 clients,
-                pipeline_output_tx,
                 port_pool,
+                node_update_tx,
             )
             .await?;
         }
@@ -301,49 +273,33 @@ async fn handle_connection<T: 'static + Transport>(
 
 async fn do_control_channel_handshake<T: 'static + Transport>(
     mut conn: T::Stream,
-    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    _services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
     clients: ClientRegistry,
-    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
     port_pool: Option<Arc<crate::port_pool::PortPool>>,
+    node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
     T::hint(&conn, SocketOpts::for_control_channel());
 
-    // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    // Send hello
     let hello_send = Hello::ControlChannelHello(
         protocol::CURRENT_PROTO_VERSION,
         nonce.clone().try_into().unwrap(),
     );
     protocol::write_hello(&mut conn, &hello_send).await?;
 
-    // Lookup the service
-    let service_config = match services.read().await.get(&service_digest) {
-        Some(v) => v,
-        None => {
-            protocol::write_ack(&mut conn, &Ack::ServiceNotExist).await?;
-            bail!("No such a service {}", hex::encode(service_digest));
-        }
-    }
-    .to_owned();
-
-    let service_name = &service_config.name;
-
-    // Calculate the checksum
-    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
+    // Token-only auth: use global default_token, no service lookup
+    let mut concat = Vec::from(server_config.default_token.as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth
     let protocol::Auth(d) = read_auth(&mut conn).await?;
 
-    // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
         protocol::write_ack(&mut conn, &Ack::AuthFailed).await?;
@@ -352,31 +308,33 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             hex::encode(session_key),
             hex::encode(d)
         );
-        bail!("Service {} failed the authentication", service_name);
-    } else {
-        let mut h = control_channels.write().await;
-
-        // If there's already a control channel for the service, then drop the old one.
-        // Because a control channel doesn't report back when it's dead,
-        // the handle in the map could be stall, dropping the old handle enables
-        // the client to reconnect.
-        if h.remove1(&service_digest).is_some() {
-            warn!(
-                "Dropping previous control channel for service {}",
-                service_name
-            );
-        }
-
-        // Send ack
-        protocol::write_ack(&mut conn, &Ack::Ok).await?;
-
-        info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval, clients, service_digest, pipeline_output_tx, port_pool);
-
-        // Insert the new handle
-        let _ = h.insert(service_digest, session_key, handle);
+        bail!("Client failed authentication");
     }
+
+    let service_name = hex::encode(service_digest);
+
+    let mut h = control_channels.write().await;
+
+    if h.remove1(&service_digest).is_some() {
+        warn!("Dropping previous control channel for {}", service_name);
+    }
+
+    protocol::write_ack(&mut conn, &Ack::Ok).await?;
+
+    // Build synthetic service config for the client
+    let service_config = ServerServiceConfig {
+        service_type: ServiceType::Tcp,
+        name: service_name.clone(),
+        bind_addr: "127.0.0.1:0".into(),
+        token: Some(server_config.default_token.clone()),
+        nodelay: None,
+    };
+
+    info!(service = %service_name, "Control channel established");
+    let handle =
+        ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval, clients, service_digest, port_pool, node_update_tx);
+
+    let _ = h.insert(service_digest, session_key, handle);
 
     Ok(())
 }
@@ -388,8 +346,6 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 ) -> Result<()> {
     debug!("Try to handshake a data channel");
 
-    // Validate — clone Arc'd fields out of the handle before dropping the read lock,
-    // so we don't hold a read lock across await points.
     let (hint_opts, port_data_pending, data_ch_tx) = {
         let guard = control_channels.read().await;
         match guard.get2(&nonce) {
@@ -427,22 +383,19 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 }
 
 pub struct ControlChannelHandle<T: Transport> {
-    // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
     service: ServerServiceConfig,
-    /// Send pipeline commands (RunPipeline, CancelPipeline) to this client
-    pub pipeline_tx: mpsc::Sender<ControlChannelCmd>,
-    /// For port-pool assigned ports: pending data channel requests
+    /// Send commands to this client's control channel
+    pub cmd_tx: mpsc::Sender<ControlChannelCmd>,
     port_data_pending: Arc<RwLock<std::collections::VecDeque<(tokio::sync::oneshot::Sender<T::Stream>, u16)>>>,
+    pub node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
 }
 
 impl<T> ControlChannelHandle<T>
 where
     T: 'static + Transport,
 {
-    // Create a control channel handle, where the control channel handling task
-    // and the connection pool task are created.
     #[instrument(name = "handle", skip_all, fields(service = %service.name))]
     fn new(
         conn: T::Stream,
@@ -450,27 +403,20 @@ where
         heartbeat_interval: u64,
         clients: ClientRegistry,
         service_digest: ServiceDigest,
-        pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
         port_pool: Option<Arc<crate::port_pool::PortPool>>,
+        node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
     ) -> ControlChannelHandle<T> {
-        // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
-
-        // Store data channels
         let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
-
-        // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
 
-        // Channel for receiving pipeline commands from admin
-        let (pipeline_tx, pipeline_rx) = mpsc::channel::<ControlChannelCmd>(64);
-        let pipeline_tx_for_registry = pipeline_tx.clone();
+        // Channel for sending commands to this client
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ControlChannelCmd>(64);
+        let cmd_tx_for_registry = cmd_tx.clone();
 
-        // Cache some data channels for later use
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
-            ServiceType::Http => TCP_POOL_SIZE, // HTTP runs over TCP
         };
 
         for _i in 0..pool_size {
@@ -479,7 +425,6 @@ where
             };
         }
 
-        // Clone before moving into connection pool
         let data_ch_req_tx_for_control = data_ch_req_tx.clone();
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
@@ -514,23 +459,7 @@ where
                         shutdown_rx_clone,
                     )
                     .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
-                }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Http => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run HTTP connection pool")
+                    .with_context(|| "Failed to run UDP connection pool")
                     {
                         error!("{:#}", e);
                     }
@@ -541,16 +470,14 @@ where
 
         let port_data_pending = Arc::new(RwLock::new(VecDeque::new()));
 
-        // Create the control channel
         let service_name = service.name.clone();
         let ch = ControlChannel::<T> {
             conn,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
-            pipeline_rx,
-            pipeline_tx: pipeline_tx_for_registry,
-            pipeline_output_tx,
+            cmd_rx,
+            cmd_tx: cmd_tx_for_registry,
             service_digest: digest_for_drop,
             service_name,
             clients,
@@ -558,15 +485,14 @@ where
             port_pool,
             data_ch_req_tx: data_ch_req_tx_for_control,
             shutdown_tx: shutdown_tx.clone(),
+            node_update_tx: node_update_tx.clone(),
         };
 
-        // Run the control channel
         tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
                 }
-                // Clean up client registry on disconnect
                 let _ = shutdown_tx_clone.send(true);
                 registry::remove(&clients_for_drop, &digest_for_drop).await;
             }
@@ -577,115 +503,98 @@ where
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
             service,
-            pipeline_tx,
+            cmd_tx,
             port_data_pending,
+            node_update_tx,
         }
     }
 }
 
-// Control channel, using T as the transport layer.
 struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
-    pipeline_rx: mpsc::Receiver<ControlChannelCmd>, // Receive pipeline commands from admin
-    pipeline_tx: mpsc::Sender<ControlChannelCmd>,   // Clone of handle's pipeline_tx (for registry)
-    pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>, // Send output to admin
-    service_digest: ServiceDigest,                 // Identifies this client
-    service_name: String,                          // Service name from config
-    clients: ClientRegistry,                       // For updating client info
-    port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>, // Port-pool pending data channels
+    conn: T::Stream,
+    shutdown_rx: broadcast::Receiver<bool>,
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>,
+    heartbeat_interval: u64,
+    cmd_rx: mpsc::Receiver<ControlChannelCmd>,
+    cmd_tx: mpsc::Sender<ControlChannelCmd>,
+    service_digest: ServiceDigest,
+    service_name: String,
+    clients: ClientRegistry,
+    port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>,
     port_pool: Option<Arc<crate::port_pool::PortPool>>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_tx: broadcast::Sender<bool>,
+    node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
 }
 
 impl<T: Transport> ControlChannel<T> {
-    // Run a control channel — bidirectional:
-    // - Read ReportStatus / PipelineOutput from client
-    // - Write CreateDataChannel / HeartBeat / RunPipeline / CancelPipeline to client
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        // Split connection for concurrent read/write
         let (mut rd, wr) = io::split(self.conn);
         let wr = Arc::new(tokio::sync::Mutex::new(wr));
 
-        // Clone fields for use in select! branches
-        let pool = self.port_pool.clone();
-        let data_ch_req_tx = self.data_ch_req_tx.clone();
-        let port_data_pending = self.port_data_pending.clone();
-        let shutdown_tx = self.shutdown_tx.clone();
+        let _pool = self.port_pool.clone();
+        let _data_ch_req_tx = self.data_ch_req_tx.clone();
+        let _port_data_pending = self.port_data_pending.clone();
+        let _shutdown_tx = self.shutdown_tx.clone();
 
-        // Wait for data channel requests, pipeline commands, and shutdown signal
         loop {
             tokio::select! {
-                // Read commands from the client (ReportStatus, PipelineOutput)
                 val = read_control_cmd(&mut rd) => {
                     match val {
-                        Ok(ControlChannelCmd::ReportStatus { hostname, os, arch, ports }) => {
-                            info!("Client status: {} {} {} ports:{:?}", hostname, os, arch, ports);
+                        Ok(ControlChannelCmd::ReportNodeStatus { hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers }) => {
+                            info!(
+                                "Client status: {} {} {} docker={} ports={}-{} cpu={} mem={}MB containers={}",
+                                hostname, os, arch, docker_version,
+                                port_range_start, port_range_end,
+                                cpu_cores, memory_mb,
+                                running_containers.len()
+                            );
                             registry::upsert(
                                 &self.clients,
                                 self.service_digest,
                                 self.service_name.clone(),
+                                hostname.clone(),
+                                os.clone(),
+                                arch.clone(),
+                                docker_version.clone(),
+                                port_range_start,
+                                port_range_end,
+                                cpu_cores,
+                                memory_mb,
+                                running_containers.clone(),
+                                self.cmd_tx.clone(),
+                            ).await;
+
+                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                digest: hex::encode(self.service_digest),
                                 hostname,
                                 os,
                                 arch,
-                                ports.clone(),
-                                self.pipeline_tx.clone(),
-                            ).await;
-
-                            // Auto-assign ports from pool
-                            if !ports.is_empty() {
-                                if let Some(ref pool) = pool {
-                                    let local_ports: Vec<u16> = ports.iter()
-                                        .filter_map(|p| p.parse::<u16>().ok())
-                                        .collect();
-                                    let digest = self.service_digest.clone();
-                                    match pool.assign(&digest, &local_ports).await {
-                                        Ok(mapping) => {
-                                            let mappings: Vec<(u16, u16)> = mapping.iter()
-                                                .map(|(l, s)| (*l, *s))
-                                                .collect();
-                                            let mut guard = wr.lock().await;
-                                            if let Err(e) = protocol::write_control_cmd(
-                                                &mut *guard,
-                                                &ControlChannelCmd::PortsAssigned { mappings: mappings.clone() },
-                                            ).await {
-                                                error!("Failed to send PortsAssigned: {:#}", e);
-                                            }
-                                            drop(guard);
-
-                                            for (local_port, server_port) in mappings {
-                                                spawn_port_accept_loop::<T>(
-                                                    pool.clone(),
-                                                    server_port,
-                                                    local_port,
-                                                    data_ch_req_tx.clone(),
-                                                    port_data_pending.clone(),
-                                                    shutdown_tx.subscribe(),
-                                                );
-                                            }
-                                        }
-                                        Err(e) => warn!("Port assignment failed: {:#}", e),
-                                    }
-                                }
-                            }
+                                docker_version,
+                                port_range_start,
+                                port_range_end,
+                                cpu_cores,
+                                memory_mb,
+                                running_containers,
+                            }).await;
                         }
-                        Ok(ControlChannelCmd::PipelineOutput { id, step, stdout, stderr, exit_code }) => {
-                            // Forward to admin
-                            let _ = self.pipeline_output_tx.send((
-                                self.service_digest,
-                                ControlChannelCmd::PipelineOutput { id, step, stdout, stderr, exit_code },
-                            )).await;
+                        Ok(ControlChannelCmd::DockerPullProgress { image, status }) => {
+                            info!("Docker pull progress: {} — {}", image, status);
                         }
-                        Ok(ControlChannelCmd::PortsAssigned { .. }) => {
-                            // Server sends this, should not receive
-                            warn!("Server received unexpected PortsAssigned (server→client message)");
+                        Ok(ControlChannelCmd::DockerBuildProgress { image_tag, status }) => {
+                            info!("Docker build progress: {} — {}", image_tag, status);
+                        }
+                        Ok(ControlChannelCmd::ContainerStarted { container_name, ports }) => {
+                            info!("Container started: {} ports:{:?}", container_name, ports);
+                        }
+                        Ok(ControlChannelCmd::ContainerStopped { container_name }) => {
+                            info!("Container stopped: {}", container_name);
+                        }
+                        Ok(ControlChannelCmd::ContainerError { container_name, error }) => {
+                            error!("Container error: {} — {}", container_name, error);
                         }
                         Ok(_) => {
-                            // CreateDataChannel / HeartBeat — client should not send these
                             debug!("Unexpected control cmd from client");
                         }
                         Err(e) => {
@@ -694,7 +603,6 @@ impl<T: Transport> ControlChannel<T> {
                         }
                     }
                 },
-                // Visitor requested → send CreateDataChannel to client
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
@@ -710,7 +618,6 @@ impl<T: Transport> ControlChannel<T> {
                         None => break,
                     }
                 },
-                // Heartbeat
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
                     let mut guard = wr.lock().await;
                     if let Err(e) = protocol::write_control_cmd(
@@ -721,8 +628,7 @@ impl<T: Transport> ControlChannel<T> {
                         break;
                     }
                 },
-                // Admin pipeline command → forward to client
-                cmd = self.pipeline_rx.recv() => {
+                cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
                             let mut guard = wr.lock().await;
@@ -734,7 +640,6 @@ impl<T: Transport> ControlChannel<T> {
                         None => break,
                     }
                 },
-                // Shutdown signal
                 _ = self.shutdown_rx.recv() => {
                     break;
                 }
@@ -747,8 +652,7 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
-/// Spawn a task that accepts connections on a pre-bound port from the port pool
-/// and forwards them through data channels to the client.
+#[allow(dead_code)]
 fn spawn_port_accept_loop<T: Transport>(
     pool: Arc<crate::port_pool::PortPool>,
     server_port: u16,
@@ -765,15 +669,11 @@ fn spawn_port_accept_loop<T: Transport>(
                         match result {
                             Ok((mut visitor, addr)) => {
                                 debug!("Port {} visitor from {}", server_port, addr);
-                                // Request a data channel from the client
                                 if data_ch_req_tx.send(true).is_err() {
                                     break;
                                 }
-                                // Queue a pending request: when the data channel arrives,
-                                // do_data_channel_handshake will route it through this sender
                                 let (tx, rx) = oneshot::channel::<T::Stream>();
                                 port_data_pending.write().await.push_back((tx, local_port));
-                                // Wait for the data channel
                                 match rx.await {
                                     Ok(mut data_ch) => {
                                         if let Err(e) = protocol::write_data_cmd(
@@ -830,35 +730,27 @@ fn tcp_listen_and_send(
 
         info!("Listening at {}", &addr);
 
-        // Retry at least every 1s
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_secs(1),
             max_elapsed_time: None,
             ..Default::default()
         };
 
-        // Wait for visitors and the shutdown signal
         loop {
             tokio::select! {
                 val = l.accept() => {
                     match val {
                         Err(e) => {
-                            // `l` is a TCP listener so this must be a IO error
-                            // Possibly a EMFILE. So sleep for a while
                             error!("{}. Sleep for a while", e);
                             if let Some(d) = backoff.next_backoff() {
                                 time::sleep(d).await;
                             } else {
-                                // This branch will never be reached for current backoff policy
                                 error!("Too many retries. Aborting...");
                                 break;
                             }
                         }
                         Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
                             if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
                                 break;
                             }
 
@@ -866,7 +758,6 @@ fn tcp_listen_and_send(
 
                             debug!("New visitor from {}", addr);
 
-                            // Send the visitor to the connection pool
                             let _ = tx.send(incoming).await;
                         }
                     }
@@ -901,7 +792,6 @@ async fn run_tcp_connection_pool<T: Transport>(
                     });
                     break;
                 } else {
-                    // Current data channel is broken. Request for a new one
                     if data_ch_req_tx.send(true).is_err() {
                         break 'pool;
                     }
@@ -923,8 +813,6 @@ async fn run_udp_connection_pool<T: Transport>(
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    // TODO: Load balance
-
     let l = retry_notify_with_deadline(
         listen_backoff(),
         || async { Ok(UdpSocket::bind(&bind_addr).await?) },
@@ -938,7 +826,6 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    // Receive one data channel
     let mut conn = data_ch_rx
         .recv()
         .await
@@ -948,13 +835,11 @@ async fn run_udp_connection_pool<T: Transport>(
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
-            // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
                 UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
             },
 
-            // Forward outbound traffic from the client to the visitor
             hdr_len = conn.read_u8() => {
                 let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
                 l.send_to(&t.data, t.from).await?;

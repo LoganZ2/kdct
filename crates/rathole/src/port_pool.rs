@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Parse a port range string like "9000-9999" or a comma-separated list like "9000-9010,9020".
 pub fn parse_port_range(spec: &str) -> Result<Vec<u16>> {
@@ -179,6 +179,16 @@ impl PortPool {
 
         for port in to_free {
             assignments.remove(&port);
+            free.insert(port);
+            info!("Port released: {}", port);
+        }
+    }
+
+    /// Release a single port by number.
+    pub async fn release_by_port(&self, port: u16) {
+        let mut free = self.free.write().await;
+        let mut assignments = self.assignments.write().await;
+        if assignments.remove(&port).is_some() {
             free.insert(port);
             info!("Port released: {}", port);
         }

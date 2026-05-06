@@ -4,7 +4,7 @@ pub mod config_watcher;
 pub mod constants;
 pub mod helper;
 pub mod multi_map;
-pub mod pipeline;
+pub mod node_update;
 pub mod port_pool;
 pub mod protocol;
 pub mod registry;

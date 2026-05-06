@@ -14,9 +14,9 @@ include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 default = [
     "server",
     "client",
-    "native-tls",
+    "rustls",
     "noise",
-    "websocket-native-tls",
+    "websocket-rustls",
     "hot-reload",
 ]
 

@@ -1,11 +1,11 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "kdct-client", about = "KDCT tunnel client")]
+#[command(name = "kdctc", about = "KDCT Docker tunnel client")]
 struct Cli {
     /// Path to client config TOML
     #[arg(long, default_value = "client.toml")]
@@ -20,8 +20,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    check_docker()?;
+
     let cli = Cli::parse();
-    let (_shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
     rathole::run(
         rathole::cli::Cli {
@@ -34,5 +36,24 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    drop(shutdown_tx);
     Ok(())
+}
+
+fn check_docker() -> Result<()> {
+    let output = std::process::Command::new("docker")
+        .arg("--version")
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!(
+                "Docker detected: {}",
+                String::from_utf8_lossy(&o.stdout).trim()
+            );
+            Ok(())
+        }
+        _ => {
+            bail!("Docker is not installed or not in PATH. Please install Docker first.")
+        }
+    }
 }

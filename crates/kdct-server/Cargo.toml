@@ -1,5 +1,5 @@
 [package]
-name = "kdct-server"
+name = "kdcts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+pingora = { version = "0.8", default-features = false, features = ["proxy", "rustls"] }
+dialoguer = "0.11"
+async-trait = "0.1"
+fdlimit = "0.2"

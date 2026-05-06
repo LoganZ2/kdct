@@ -15,31 +15,22 @@ pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
-// ── Pipeline types ──────────────────────────────────────────────
+// ── Container info ──────────────────────────────────────────────
 
-/// Unique identifier for a pipeline run
-pub type PipelineId = String;
-
-/// A single step in a pipeline
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct PipelineStep {
-    /// Human-readable step name (e.g., "install", "build")
-    pub name: String,
-    /// Shell command to execute
-    pub command: String,
-    /// Working directory (defaults to current dir if None)
-    pub cwd: Option<String>,
-    /// Timeout in seconds (0 = no timeout)
-    #[serde(default)]
-    pub timeout_secs: u64,
+pub struct ContainerInfo {
+    pub container_name: String,
+    pub image: String,
+    pub ports: Vec<u16>,
+    pub status: String,
 }
 
 // ── Wire message types ──────────────────────────────────────────
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
-    ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
-    DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
+    ControlChannelHello(ProtocolVersion, Digest),
+    DataChannelHello(ProtocolVersion, Digest),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -70,54 +61,77 @@ impl std::fmt::Display for Ack {
 pub enum ControlChannelCmd {
     CreateDataChannel,
     HeartBeat,
-    /// Server → Client: Execute a pipeline
-    RunPipeline {
-        id: PipelineId,
-        steps: Vec<PipelineStep>,
-    },
-    /// Server → Client: Cancel a running pipeline
-    CancelPipeline {
-        id: PipelineId,
-    },
-    /// Client → Server: Streaming output from a pipeline step
-    PipelineOutput {
-        id: PipelineId,
-        step: String,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-        exit_code: Option<i32>,
-    },
+
+    // ── Port assignment ──────────────────────────────────────
     /// Server → Client: Port assignments from the pool
     PortsAssigned {
-        /// (local_port, server_port) pairs
         mappings: Vec<(u16, u16)>,
     },
-    /// Client → Server: Client info + available ports reported on connect
-    ReportStatus {
+
+    // ── Node status ──────────────────────────────────────────
+    /// Client → Server: Node info + available ports reported on connect/reconnect
+    ReportNodeStatus {
         hostname: String,
         os: String,
         arch: String,
-        /// Available local ports, e.g. ["3000-3005", "8080"]
-        ports: Vec<String>,
+        docker_version: String,
+        port_range_start: u16,
+        port_range_end: u16,
+        cpu_cores: u32,
+        memory_mb: u64,
+        running_containers: Vec<ContainerInfo>,
+    },
+
+    // ── Docker commands (Server → Client) ────────────────────
+    DockerPull {
+        image: String,
+    },
+    DockerBuild {
+        git_url: String,
+        branch: String,
+        image_tag: String,
+    },
+    DockerRun {
+        image_tag: String,
+        container_name: String,
+        port_map: Vec<(u16, u16)>,
+        env: Vec<(String, String)>,
+    },
+    DockerStop {
+        container_name: String,
+    },
+
+    // ── Docker responses (Client → Server) ───────────────────
+    DockerPullProgress {
+        image: String,
+        status: String, // "pulling", "complete", "error:..."
+    },
+    DockerBuildProgress {
+        image_tag: String,
+        status: String, // "building", "complete", "error:..."
+    },
+    ContainerStarted {
+        container_name: String,
+        ports: Vec<u16>,
+    },
+    ContainerStopped {
+        container_name: String,
+    },
+    ContainerError {
+        container_name: String,
+        error: String,
     },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
-    /// Start TCP forwarding.
-    /// None → use config's local_addr. Some(port) → connect to localhost:port.
     StartForwardTcp(Option<u16>),
     StartForwardUdp,
-    /// Start HTTP forwarding with optional host/path routing
-    StartForwardHttp {
-        path_prefix: Option<String>,
-        host: Option<String>,
-    },
 }
 
 // ── UDP traffic (unchanged wire format) ─────────────────────────
 
-type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
+type UdpPacketLen = u16;
 #[derive(Deserialize, Serialize, Debug)]
 struct UdpHeader {
     from: SocketAddr,

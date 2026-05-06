@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -68,10 +68,16 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
-    /// Available local port pool, e.g. ["3000-3005", "8080"]
-    #[serde(default)]
-    pub ports: Option<Vec<String>>,
+    /// Client-side Docker port range start (default 3000)
+    #[serde(default = "default_port_start")]
+    pub port_range_start: u16,
+    /// Client-side Docker port range end (default 3999)
+    #[serde(default = "default_port_end")]
+    pub port_range_end: u16,
 }
+
+fn default_port_start() -> u16 { 3000 }
+fn default_port_end() -> u16 { 3999 }
 
 impl ClientServiceConfig {
     pub fn with_name(name: &str) -> ClientServiceConfig {
@@ -79,6 +85,10 @@ impl ClientServiceConfig {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    pub fn port_range(&self) -> (u16, u16) {
+        (self.port_range_start, self.port_range_end)
     }
 }
 
@@ -89,8 +99,6 @@ pub enum ServiceType {
     Tcp,
     #[serde(rename = "udp")]
     Udp,
-    #[serde(rename = "http")]
-    Http,
 }
 
 fn default_service_type() -> ServiceType {
@@ -209,6 +217,7 @@ pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: MaskedString,
     pub prefer_ipv6: Option<bool>,
+    #[serde(default)]
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
@@ -222,20 +231,37 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_port_pool() -> String {
+    "9000-9999".to_string()
+}
+
+fn default_http_port() -> u16 {
+    80
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub default_token: MaskedString,
+    #[serde(default)]
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
     /// Port pool for auto-assignment (e.g. "9000-9999")
+    #[serde(default = "default_port_pool")]
     pub port_pool: String,
-    /// Web dashboard port
-    pub web_port: u16,
+    /// Domain for reverse proxy (e.g. "example.com")
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// HTTP port for reverse proxy (default 80)
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+    /// HTTPS port for reverse proxy (0 = disabled)
+    #[serde(default)]
+    pub https_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -412,11 +438,8 @@ mod tests {
             },
         );
 
-        // Missing the token
-        assert!(Config::validate_server_config(&mut cfg).is_err());
-
-        // Use the default token
-        cfg.default_token = Some("123".into());
+        // Default token fills missing service token
+        cfg.default_token = "123".into();
         assert!(Config::validate_server_config(&mut cfg).is_ok());
         assert_eq!(
             cfg.services
@@ -462,11 +485,8 @@ mod tests {
             },
         );
 
-        // Missing the token
-        assert!(Config::validate_client_config(&mut cfg).is_err());
-
-        // Use the default token
-        cfg.default_token = Some("123".into());
+        // Default token fills missing service token
+        cfg.default_token = "123".into();
         assert!(Config::validate_client_config(&mut cfg).is_ok());
         assert_eq!(
             cfg.services

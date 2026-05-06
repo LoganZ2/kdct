@@ -1,9 +1,9 @@
 //! Connected-client registry.
 //!
-//! When a client connects and sends `ReportStatus`, its entry is updated.
-//! The admin layer queries this registry for `list` and `pipeline send`.
+//! When a client connects and sends `ReportNodeStatus`, its entry is updated.
+//! The admin layer queries this registry for client info.
 
-use crate::protocol::{ControlChannelCmd, Digest};
+use crate::protocol::{ContainerInfo, ControlChannelCmd, Digest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -16,10 +16,14 @@ pub struct ClientEntry {
     pub hostname: String,
     pub os: String,
     pub arch: String,
-    /// Available local ports, e.g. ["3000-3005", "8080"]
-    pub ports: Vec<String>,
-    /// Send pipeline commands to this client's control channel
-    pub pipeline_tx: mpsc::Sender<ControlChannelCmd>,
+    pub docker_version: String,
+    pub port_range_start: u16,
+    pub port_range_end: u16,
+    pub cpu_cores: u32,
+    pub memory_mb: u64,
+    pub running_containers: Vec<ContainerInfo>,
+    /// Send commands to this client's control channel
+    pub cmd_tx: mpsc::Sender<ControlChannelCmd>,
 }
 
 /// Shared client registry, indexed by service digest.
@@ -30,8 +34,7 @@ pub fn new_registry() -> ClientRegistry {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Update a client entry when ReportStatus is received.
-/// If the client is not yet in the registry, inserts it.
+/// Update a client entry when ReportNodeStatus is received.
 pub async fn upsert(
     registry: &ClientRegistry,
     digest: Digest,
@@ -39,8 +42,13 @@ pub async fn upsert(
     hostname: String,
     os: String,
     arch: String,
-    ports: Vec<String>,
-    pipeline_tx: mpsc::Sender<ControlChannelCmd>,
+    docker_version: String,
+    port_range_start: u16,
+    port_range_end: u16,
+    cpu_cores: u32,
+    memory_mb: u64,
+    running_containers: Vec<ContainerInfo>,
+    cmd_tx: mpsc::Sender<ControlChannelCmd>,
 ) {
     let mut guard = registry.write().await;
     let is_new = !guard.contains_key(&digest);
@@ -51,8 +59,13 @@ pub async fn upsert(
             hostname,
             os,
             arch,
-            ports,
-            pipeline_tx,
+            docker_version,
+            port_range_start,
+            port_range_end,
+            cpu_cores,
+            memory_mb,
+            running_containers,
+            cmd_tx,
         },
     );
     if is_new {
