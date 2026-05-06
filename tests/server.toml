@@ -1,6 +1,7 @@
 [server]
 bind_addr = "0.0.0.0:2334"
 default_token = "test-token"
+port_pool = "9000-9005"
 
 [server.transport]
 type = "tcp"

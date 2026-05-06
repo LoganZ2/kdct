@@ -206,8 +206,9 @@ impl<T: 'static + Transport> Server<T> {
                                             let server_config = self.config.clone();
                                             let clients = self.clients.clone();
                                             let pipeline_output_tx = self.pipeline_output_tx.clone();
+                                            let port_pool = self.port_pool.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, clients, pipeline_output_tx).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, clients, pipeline_output_tx, port_pool).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -273,6 +274,7 @@ async fn handle_connection<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     clients: ClientRegistry,
     pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
+    port_pool: Option<Arc<crate::port_pool::PortPool>>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
@@ -286,6 +288,7 @@ async fn handle_connection<T: 'static + Transport>(
                 server_config,
                 clients,
                 pipeline_output_tx,
+                port_pool,
             )
             .await?;
         }
@@ -304,6 +307,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     server_config: Arc<ServerConfig>,
     clients: ClientRegistry,
     pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
+    port_pool: Option<Arc<crate::port_pool::PortPool>>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -368,7 +372,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
         info!(service = %service_config.name, "Control channel established");
         let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval, clients, service_digest, pipeline_output_tx);
+            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval, clients, service_digest, pipeline_output_tx, port_pool);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -390,12 +394,21 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
         Some(handle) => {
             T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
 
-            // Send the data channel to the corresponding control channel
-            handle
-                .data_ch_tx
-                .send(conn)
-                .await
-                .with_context(|| "Data channel for a stale control channel")?;
+            // Check if there's a pending port data request
+            let mut pending = handle.port_data_pending.write().await;
+            if let Some((sender, _local_port)) = pending.pop_front() {
+                // Route to port accept loop
+                drop(pending);
+                let _ = sender.send(conn);
+            } else {
+                // Route to connection pool
+                drop(pending);
+                handle
+                    .data_ch_tx
+                    .send(conn)
+                    .await
+                    .with_context(|| "Data channel for a stale control channel")?;
+            }
         }
         None => {
             warn!("Data channel has incorrect nonce");
@@ -429,6 +442,7 @@ where
         clients: ClientRegistry,
         service_digest: ServiceDigest,
         pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
+        port_pool: Option<Arc<crate::port_pool::PortPool>>,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -455,6 +469,9 @@ where
                 error!("Failed to request data channel {}", e);
             };
         }
+
+        // Clone before moving into connection pool
+        let data_ch_req_tx_for_control = data_ch_req_tx.clone();
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
@@ -527,6 +544,9 @@ where
             service_digest: digest_for_drop,
             clients,
             port_data_pending: port_data_pending.clone(),
+            port_pool,
+            data_ch_req_tx: data_ch_req_tx_for_control,
+            shutdown_tx: shutdown_tx.clone(),
         };
 
         // Run the control channel
@@ -564,6 +584,9 @@ struct ControlChannel<T: Transport> {
     service_digest: ServiceDigest,                 // Identifies this client
     clients: ClientRegistry,                       // For updating client info
     port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>, // Port-pool pending data channels
+    port_pool: Option<Arc<crate::port_pool::PortPool>>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    shutdown_tx: broadcast::Sender<bool>,
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -575,6 +598,12 @@ impl<T: Transport> ControlChannel<T> {
         // Split connection for concurrent read/write
         let (mut rd, wr) = io::split(self.conn);
         let wr = Arc::new(tokio::sync::Mutex::new(wr));
+
+        // Clone fields for use in select! branches
+        let pool = self.port_pool.clone();
+        let data_ch_req_tx = self.data_ch_req_tx.clone();
+        let port_data_pending = self.port_data_pending.clone();
+        let shutdown_tx = self.shutdown_tx.clone();
 
         // Wait for data channel requests, pipeline commands, and shutdown signal
         loop {
@@ -591,9 +620,46 @@ impl<T: Transport> ControlChannel<T> {
                                 hostname,
                                 os,
                                 arch,
-                                ports,
+                                ports.clone(),
                                 self.pipeline_tx.clone(),
                             ).await;
+
+                            // Auto-assign ports from pool
+                            if !ports.is_empty() {
+                                if let Some(ref pool) = pool {
+                                    let local_ports: Vec<u16> = ports.iter()
+                                        .filter_map(|p| p.parse::<u16>().ok())
+                                        .collect();
+                                    let digest = self.service_digest.clone();
+                                    match pool.assign(&digest, &local_ports).await {
+                                        Ok(mapping) => {
+                                            let mappings: Vec<(u16, u16)> = mapping.iter()
+                                                .map(|(l, s)| (*l, *s))
+                                                .collect();
+                                            let mut guard = wr.lock().await;
+                                            if let Err(e) = protocol::write_control_cmd(
+                                                &mut *guard,
+                                                &ControlChannelCmd::PortsAssigned { mappings: mappings.clone() },
+                                            ).await {
+                                                error!("Failed to send PortsAssigned: {:#}", e);
+                                            }
+                                            drop(guard);
+
+                                            for (local_port, server_port) in mappings {
+                                                spawn_port_accept_loop::<T>(
+                                                    pool.clone(),
+                                                    server_port,
+                                                    local_port,
+                                                    data_ch_req_tx.clone(),
+                                                    port_data_pending.clone(),
+                                                    shutdown_tx.subscribe(),
+                                                );
+                                            }
+                                        }
+                                        Err(e) => warn!("Port assignment failed: {:#}", e),
+                                    }
+                                }
+                            }
                         }
                         Ok(ControlChannelCmd::PipelineOutput { id, step, stdout, stderr, exit_code }) => {
                             // Forward to admin
@@ -667,6 +733,64 @@ impl<T: Transport> ControlChannel<T> {
 
         Ok(())
     }
+}
+
+/// Spawn a task that accepts connections on a pre-bound port from the port pool
+/// and forwards them through data channels to the client.
+fn spawn_port_accept_loop<T: Transport>(
+    pool: Arc<crate::port_pool::PortPool>,
+    server_port: u16,
+    local_port: u16,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) {
+    tokio::spawn(
+        async move {
+            loop {
+                tokio::select! {
+                    result = pool.accept(server_port) => {
+                        match result {
+                            Ok((mut visitor, addr)) => {
+                                debug!("Port {} visitor from {}", server_port, addr);
+                                // Request a data channel from the client
+                                if data_ch_req_tx.send(true).is_err() {
+                                    break;
+                                }
+                                // Queue a pending request: when the data channel arrives,
+                                // do_data_channel_handshake will route it through this sender
+                                let (tx, rx) = oneshot::channel::<T::Stream>();
+                                port_data_pending.write().await.push_back((tx, local_port));
+                                // Wait for the data channel
+                                match rx.await {
+                                    Ok(mut data_ch) => {
+                                        if let Err(e) = protocol::write_data_cmd(
+                                            &mut data_ch,
+                                            &DataChannelCmd::StartForwardTcp(Some(local_port)),
+                                        ).await {
+                                            error!("Failed to write StartForwardTcp: {:#}", e);
+                                            continue;
+                                        }
+                                        let _ = copy_bidirectional(&mut data_ch, &mut visitor).await;
+                                    }
+                                    Err(_) => debug!("Port data channel request cancelled"),
+                                }
+                            }
+                            Err(e) => {
+                                error!("Accept error on port {}: {:#}", server_port, e);
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+            info!("Port {} accept loop shutdown", server_port);
+        }
+        .instrument(Span::current()),
+    );
 }
 
 fn tcp_listen_and_send(
