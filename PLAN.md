@@ -231,16 +231,19 @@ Client executes sequentially via `sh -c` (Unix) / `cmd /C` (Windows), streams st
 - [x] Background tokio thread runs rathole client
 - [x] Config at ~/.config/kdct/kdct-client.toml, opens in default editor
 
-### Phase 6 — HTTP reverse proxy (post-MVP if needed)
-- [ ] `StartForwardHttp` data channel command
-- [ ] Host/path-based routing on server side
-- [ ] HTTP header forwarding
+### Phase 6 — Dynamic port pool + reverse proxy ✅ DONE
+- [x] PortPool: pre-bind all ports on startup, fail if any occupied
+- [x] Client reports port pool via ReportStatus, server auto-assigns
+- [x] PortsAssigned protocol message, dynamic accept loops on pre-bound listeners
+- [x] Admin list shows client ports
+- [x] E2E verified: pool auto-assign, TCP forwarding, pipeline dispatch
 
 ## Verification
 
-1. `cargo build --workspace` — all crates compile
-2. Start server: `kdct-server start --config server.toml`
-3. Start client: `kdct-client start --config client.toml`
-4. Server shows client in `kdct-server list`
-5. `curl cloud-vps:8080` → forwarded to client's `localhost:3000`
-6. `kdct-server pipeline send --client my-machine --file pipeline.yaml` → client executes → output streams back
+1. `cargo build --workspace` — all crates compile ✅
+2. Start server: `kdct-server start --config tests/server.toml` → port pool binds, admin API alive ✅
+3. Start client: `kdct-client --config tests/client.toml` → connects, ports auto-assigned ✅
+4. Server shows client in `kdct-server list` — with hostname, OS, arch, ports ✅
+5. `curl server:9999` → forwarded to client's local service (static service) ✅
+6. `curl server:9000` → forwarded to client:3000 (dynamic port assignment) ✅
+7. Pipeline send → client executes → output streams back ✅

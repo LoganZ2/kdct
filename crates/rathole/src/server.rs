@@ -388,31 +388,40 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 ) -> Result<()> {
     debug!("Try to handshake a data channel");
 
-    // Validate
-    let control_channels_guard = control_channels.read().await;
-    match control_channels_guard.get2(&nonce) {
-        Some(handle) => {
-            T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
-
-            // Check if there's a pending port data request
-            let mut pending = handle.port_data_pending.write().await;
-            if let Some((sender, _local_port)) = pending.pop_front() {
-                // Route to port accept loop
-                drop(pending);
-                let _ = sender.send(conn);
-            } else {
-                // Route to connection pool
-                drop(pending);
-                handle
-                    .data_ch_tx
-                    .send(conn)
-                    .await
-                    .with_context(|| "Data channel for a stale control channel")?;
+    // Validate — clone Arc'd fields out of the handle before dropping the read lock,
+    // so we don't hold a read lock across await points.
+    let (hint_opts, port_data_pending, data_ch_tx) = {
+        let guard = control_channels.read().await;
+        match guard.get2(&nonce) {
+            Some(handle) => (
+                Some(SocketOpts::from_server_cfg(&handle.service)),
+                Some(handle.port_data_pending.clone()),
+                Some(handle.data_ch_tx.clone()),
+            ),
+            None => {
+                warn!("Data channel has incorrect nonce");
+                (None, None, None)
             }
         }
-        None => {
-            warn!("Data channel has incorrect nonce");
-        }
+    };
+
+    let (hint_opts, port_data_pending, data_ch_tx) = match (hint_opts, port_data_pending, data_ch_tx) {
+        (Some(h), Some(p), Some(tx)) => (h, p, tx),
+        _ => return Ok(()),
+    };
+
+    T::hint(&conn, hint_opts);
+
+    let mut pending = port_data_pending.write().await;
+    if let Some((sender, _local_port)) = pending.pop_front() {
+        drop(pending);
+        let _ = sender.send(conn);
+    } else {
+        drop(pending);
+        data_ch_tx
+            .send(conn)
+            .await
+            .with_context(|| "Data channel for a stale control channel")?;
     }
     Ok(())
 }
@@ -533,6 +542,7 @@ where
         let port_data_pending = Arc::new(RwLock::new(VecDeque::new()));
 
         // Create the control channel
+        let service_name = service.name.clone();
         let ch = ControlChannel::<T> {
             conn,
             shutdown_rx,
@@ -542,6 +552,7 @@ where
             pipeline_tx: pipeline_tx_for_registry,
             pipeline_output_tx,
             service_digest: digest_for_drop,
+            service_name,
             clients,
             port_data_pending: port_data_pending.clone(),
             port_pool,
@@ -582,6 +593,7 @@ struct ControlChannel<T: Transport> {
     pipeline_tx: mpsc::Sender<ControlChannelCmd>,   // Clone of handle's pipeline_tx (for registry)
     pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>, // Send output to admin
     service_digest: ServiceDigest,                 // Identifies this client
+    service_name: String,                          // Service name from config
     clients: ClientRegistry,                       // For updating client info
     port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>, // Port-pool pending data channels
     port_pool: Option<Arc<crate::port_pool::PortPool>>,
@@ -616,7 +628,7 @@ impl<T: Transport> ControlChannel<T> {
                             registry::upsert(
                                 &self.clients,
                                 self.service_digest,
-                                hostname.clone(),
+                                self.service_name.clone(),
                                 hostname,
                                 os,
                                 arch,
