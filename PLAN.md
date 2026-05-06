@@ -205,12 +205,12 @@ Client executes sequentially via `sh -c` (Unix) / `cmd /C` (Windows), streams st
 - [x] Make key types public (Transport, Client, Server, ControlChannelHandle)
 - [x] Add to workspace
 
-### Phase 2 — Extend protocol + config
-- [ ] Upgrade protocol from fixed-size to length-prefixed encoding
-- [ ] Add `ControlChannelCmd::RunPipeline/CancelPipeline/PipelineOutput/ReportStatus`
-- [ ] Add `DataChannelCmd::StartForwardHttp`
-- [ ] Add `ServiceType::Http`
-- [ ] Wire up encoding/decoding for new message types
+### Phase 2 — Extend protocol + config ✅ DONE
+- [x] Upgrade protocol from fixed-size to length-prefixed encoding
+- [x] Add `ControlChannelCmd::RunPipeline/CancelPipeline/PipelineOutput/ReportStatus`
+- [x] Add `DataChannelCmd::StartForwardHttp`
+- [x] Add `ServiceType::Http`
+- [x] Wire up encoding/decoding for new message types
 
 ### Phase 3 — Pipeline executor (client side)
 - [ ] Implement `pipeline.rs` in kdct-client
