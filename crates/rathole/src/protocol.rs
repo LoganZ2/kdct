@@ -86,17 +86,26 @@ pub enum ControlChannelCmd {
         stderr: Vec<u8>,
         exit_code: Option<i32>,
     },
-    /// Client → Server: Client info reported on connect
+    /// Server → Client: Port assignments from the pool
+    PortsAssigned {
+        /// (local_port, server_port) pairs
+        mappings: Vec<(u16, u16)>,
+    },
+    /// Client → Server: Client info + available ports reported on connect
     ReportStatus {
         hostname: String,
         os: String,
         arch: String,
+        /// Available local ports, e.g. ["3000-3005", "8080"]
+        ports: Vec<String>,
     },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
-    StartForwardTcp,
+    /// Start TCP forwarding.
+    /// None → use config's local_addr. Some(port) → connect to localhost:port.
+    StartForwardTcp(Option<u16>),
     StartForwardUdp,
     /// Start HTTP forwarding with optional host/path routing
     StartForwardHttp {

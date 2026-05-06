@@ -6,7 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+
+mod editor;
 
 enum StatusUpdate {
     Connected,
@@ -21,6 +26,8 @@ fn main() -> Result<()> {
         )
         .init();
 
+    let event_loop = EventLoop::new()?;
+
     let config_path = config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("kdct-client.toml");
@@ -30,7 +37,6 @@ fn main() -> Result<()> {
     let icon_red = make_tray_icon(220, 60, 60);
     let icon_green = make_tray_icon(60, 200, 60);
 
-    // Build menu
     let menu = Menu::new();
     let start_item = MenuItem::new("Start Client", true, None);
     let stop_item = MenuItem::new("Stop Client", true, None);
@@ -44,33 +50,95 @@ fn main() -> Result<()> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
 
-    // Build tray icon
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("kdct — disconnected")
         .with_icon(icon_red.clone())
         .build()?;
 
-    let tray_icon_red = icon_red;
-    let tray_icon_green = icon_green;
-
     type ShutdownTx = Option<oneshot::Sender<()>>;
     let shutdown_tx: Arc<Mutex<ShutdownTx>> = Arc::new(Mutex::new(None));
-
-    // Channel for status updates from background thread
     let (status_tx, status_rx) = std_mpsc::channel::<StatusUpdate>();
 
-    // Menu event loop (blocking, on main thread)
-    loop {
-        // Process menu events
-        if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == start_item.id() {
-                if !connected.load(Ordering::SeqCst) {
-                    let (tx, rx) = oneshot::channel();
-                    *shutdown_tx.lock().unwrap() = Some(tx);
+    let mut app = PanelApp {
+        tray,
+        icon_red,
+        icon_green,
+        connected,
+        shutdown_tx,
+        status_rx,
+        config_path,
+        start_item_id: start_item.id().clone(),
+        stop_item_id: stop_item.id().clone(),
+        edit_item_id: edit_item.id().clone(),
+        quit_item_id: quit_item.id().clone(),
+        status_tx,
+        editor: None,
+    };
 
-                    let path = config_path.clone();
-                    let tx = status_tx.clone();
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
+}
+
+struct PanelApp {
+    tray: TrayIcon,
+    icon_red: Icon,
+    icon_green: Icon,
+    connected: Arc<AtomicBool>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    status_rx: std_mpsc::Receiver<StatusUpdate>,
+    config_path: PathBuf,
+    start_item_id: muda::MenuId,
+    stop_item_id: muda::MenuId,
+    edit_item_id: muda::MenuId,
+    quit_item_id: muda::MenuId,
+    status_tx: std_mpsc::Sender<StatusUpdate>,
+    editor: Option<editor::EditorState>,
+}
+
+impl ApplicationHandler for PanelApp {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        // Forward to editor if active
+        if let Some(ref mut editor) = &mut self.editor {
+            if editor.window().id() == window_id {
+                let _ = editor.on_window_event(&event);
+                match event {
+                    WindowEvent::CloseRequested => {
+                        if editor.dirty() {
+                            // Save before closing
+                            if let Err(e) = editor.save(&self.config_path) {
+                                tracing::error!("Failed to save config: {:#}", e);
+                            }
+                        }
+                        self.editor = None;
+                    }
+                    WindowEvent::RedrawRequested => {
+                        editor.render().ok();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Process tray menu events
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == self.start_item_id {
+                if !self.connected.load(Ordering::SeqCst) {
+                    let (tx, rx) = oneshot::channel();
+                    *self.shutdown_tx.lock().unwrap() = Some(tx);
+
+                    let path = self.config_path.clone();
+                    let tx = self.status_tx.clone();
 
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
@@ -91,43 +159,60 @@ fn main() -> Result<()> {
                 }
             }
 
-            if event.id == stop_item.id() {
-                if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+            if event.id == self.stop_item_id {
+                if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
             }
 
-            if event.id == edit_item.id() {
-                if let Err(e) = open::that(config_path.as_os_str()) {
-                    tracing::error!("Failed to open config: {:#}", e);
+            if event.id == self.edit_item_id {
+                // Open editor window (or refocus if already open)
+                if self.editor.is_none() {
+                    match editor::EditorState::new(
+                        event_loop,
+                        &self.config_path,
+                    ) {
+                        Ok(ed) => self.editor = Some(ed),
+                        Err(e) => tracing::error!("Failed to open editor: {:#}", e),
+                    }
                 }
             }
 
-            if event.id == quit_item.id() {
-                if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+            if event.id == self.quit_item_id {
+                if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
-                std::process::exit(0);
+                event_loop.exit();
+                return;
             }
         }
 
-        // Process status updates from background threads
-        while let Ok(update) = status_rx.try_recv() {
+        // Process status updates
+        while let Ok(update) = self.status_rx.try_recv() {
             match update {
                 StatusUpdate::Connected => {
-                    connected.store(true, Ordering::SeqCst);
-                    tray.set_icon(Some(tray_icon_green.clone())).ok();
-                    tray.set_tooltip(Some("kdct — connected")).ok();
+                    self.connected.store(true, Ordering::SeqCst);
+                    self.tray.set_icon(Some(self.icon_green.clone())).ok();
+                    self.tray.set_tooltip(Some("kdct — connected")).ok();
                 }
                 StatusUpdate::Disconnected => {
-                    connected.store(false, Ordering::SeqCst);
-                    tray.set_icon(Some(tray_icon_red.clone())).ok();
-                    tray.set_tooltip(Some("kdct — disconnected")).ok();
+                    self.connected.store(false, Ordering::SeqCst);
+                    self.tray.set_icon(Some(self.icon_red.clone())).ok();
+                    self.tray.set_tooltip(Some("kdct — disconnected")).ok();
                 }
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Request redraw if editor is open
+        if let Some(ref editor) = &self.editor {
+            editor.window().request_redraw();
+        }
+
+        event_loop.set_control_flow(if self.editor.is_some() {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::Wait
+        });
     }
 }
 
@@ -154,17 +239,13 @@ async fn run_client(config_path: PathBuf, shutdown: oneshot::Receiver<()>) -> Re
     tokio::select! {
         _ = shutdown_join => {
             let _ = tx.send(true);
-            drop(tx); // drop broadcast sender so client task can exit
         }
-        _ = handle => {
-            // Client exited on its own — broadcast sender dropped, all good
-        }
+        _ = handle => {}
     }
 
     Ok(())
 }
 
-/// Generate a 32x32 tray icon — a filled circle with the given RGB color.
 fn make_tray_icon(r: u8, g: u8, b: u8) -> Icon {
     let size = 32u32;
     let mut img = RgbaImage::new(size, size);

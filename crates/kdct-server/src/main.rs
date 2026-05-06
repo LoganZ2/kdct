@@ -102,7 +102,12 @@ async fn start_server(config_path: PathBuf, admin_port: u16) -> Result<()> {
     // For TLS/Noise/WebSocket, compile rathole with the appropriate features.
     match server_config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(server_config).await?;
+            let pool = if let Some(ref range) = server_config.port_pool {
+                Some(rathole::port_pool::PortPool::new(range).await?)
+            } else {
+                None
+            };
+            let mut server = Server::<TcpTransport>::from(server_config, pool).await?;
             let clients = server.clients.clone();
             let rx = std::mem::replace(
                 &mut server.pipeline_output_rx,

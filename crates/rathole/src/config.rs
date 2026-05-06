@@ -68,6 +68,9 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
+    /// Available local port pool, e.g. ["3000-3005", "8080"]
+    #[serde(default)]
+    pub ports: Option<Vec<String>>,
 }
 
 impl ClientServiceConfig {
@@ -229,6 +232,9 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    /// Port pool for auto-assignment (e.g. "9000-9999")
+    #[serde(default)]
+    pub port_pool: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

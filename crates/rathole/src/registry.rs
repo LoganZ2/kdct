@@ -16,6 +16,8 @@ pub struct ClientEntry {
     pub hostname: String,
     pub os: String,
     pub arch: String,
+    /// Available local ports, e.g. ["3000-3005", "8080"]
+    pub ports: Vec<String>,
     /// Send pipeline commands to this client's control channel
     pub pipeline_tx: mpsc::Sender<ControlChannelCmd>,
 }
@@ -37,6 +39,7 @@ pub async fn upsert(
     hostname: String,
     os: String,
     arch: String,
+    ports: Vec<String>,
     pipeline_tx: mpsc::Sender<ControlChannelCmd>,
 ) {
     let mut guard = registry.write().await;
@@ -48,6 +51,7 @@ pub async fn upsert(
             hostname,
             os,
             arch,
+            ports,
             pipeline_tx,
         },
     );

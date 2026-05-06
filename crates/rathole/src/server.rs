@@ -54,13 +54,13 @@ pub async fn run_server(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config).await?;
+            let mut server = Server::<TcpTransport>::from(config, None).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config).await?;
+                let mut server = Server::<TlsTransport>::from(config, None).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -69,7 +69,7 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config).await?;
+                let mut server = Server::<NoiseTransport>::from(config, None).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -78,7 +78,7 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config).await?;
+                let mut server = Server::<WebsocketTransport>::from(config, None).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -106,6 +106,8 @@ pub struct Server<T: Transport> {
     transport: Arc<T>,
     // Connected client registry (pub for admin API)
     pub clients: ClientRegistry,
+    // Port pool for auto-assignment
+    pub port_pool: Option<Arc<crate::port_pool::PortPool>>,
     // Pipeline output channel (read by admin layer)
     pub pipeline_output_rx: mpsc::Receiver<(ServiceDigest, ControlChannelCmd)>,
     pipeline_output_tx: mpsc::Sender<(ServiceDigest, ControlChannelCmd)>,
@@ -124,7 +126,10 @@ fn generate_service_hashmap(
 
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
-    pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+    pub async fn from(
+        config: ServerConfig,
+        port_pool: Option<Arc<crate::port_pool::PortPool>>,
+    ) -> Result<Server<T>> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
@@ -137,6 +142,7 @@ impl<T: 'static + Transport> Server<T> {
             control_channels,
             transport,
             clients,
+            port_pool,
             pipeline_output_rx,
             pipeline_output_tx,
         })
@@ -569,8 +575,8 @@ impl<T: Transport> ControlChannel<T> {
                 // Read commands from the client (ReportStatus, PipelineOutput)
                 val = read_control_cmd(&mut rd) => {
                     match val {
-                        Ok(ControlChannelCmd::ReportStatus { hostname, os, arch }) => {
-                            info!("Client status: {} {} {}", hostname, os, arch);
+                        Ok(ControlChannelCmd::ReportStatus { hostname, os, arch, ports }) => {
+                            info!("Client status: {} {} {} ports:{:?}", hostname, os, arch, ports);
                             registry::upsert(
                                 &self.clients,
                                 self.service_digest,
@@ -578,6 +584,7 @@ impl<T: Transport> ControlChannel<T> {
                                 hostname,
                                 os,
                                 arch,
+                                ports,
                                 self.pipeline_tx.clone(),
                             ).await;
                         }
@@ -587,6 +594,10 @@ impl<T: Transport> ControlChannel<T> {
                                 self.service_digest,
                                 ControlChannelCmd::PipelineOutput { id, step, stdout, stderr, exit_code },
                             )).await;
+                        }
+                        Ok(ControlChannelCmd::PortsAssigned { .. }) => {
+                            // Server sends this, should not receive
+                            warn!("Server received unexpected PortsAssigned (server→client message)");
                         }
                         Ok(_) => {
                             // CreateDataChannel / HeartBeat — client should not send these
@@ -741,7 +752,7 @@ async fn run_tcp_connection_pool<T: Transport>(
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
-                if protocol::write_data_cmd(&mut ch, &DataChannelCmd::StartForwardTcp).await.is_ok() {
+                if protocol::write_data_cmd(&mut ch, &DataChannelCmd::StartForwardTcp(None)).await.is_ok() {
                     tokio::spawn(async move {
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });

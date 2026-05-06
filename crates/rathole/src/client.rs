@@ -216,11 +216,12 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
     // Forward
     match read_data_cmd(&mut conn).await? {
-        DataChannelCmd::StartForwardTcp => {
-            if args.service.service_type != ServiceType::Tcp {
-                bail!("Expect TCP traffic. Please check the configuration.")
-            }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+        DataChannelCmd::StartForwardTcp(local_port) => {
+            let addr = match local_port {
+                Some(port) => format!("127.0.0.1:{}", port),
+                None => args.service.local_addr.clone(),
+            };
+            run_data_channel_for_tcp::<T>(conn, &addr).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
@@ -469,6 +470,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
                     hostname,
                     os,
                     arch,
+                    ports: self.service.ports.clone().unwrap_or_default(),
                 },
             )
             .await
@@ -532,6 +534,10 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         }
                         ControlChannelCmd::PipelineOutput { .. } => {
                             warn!("Client received unexpected PipelineOutput (client→server message)");
+                        }
+                        ControlChannelCmd::PortsAssigned { mappings } => {
+                            info!("Server assigned ports: {:?}", mappings);
+                            // TODO: update local port registry with assigned server ports
                         }
                         ControlChannelCmd::ReportStatus { .. } => {
                             warn!("Client received unexpected ReportStatus (client→server message)");
