@@ -1,0 +1,12 @@
+[package]
+name = "kdct-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rathole = { path = "../rathole", features = ["client"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
