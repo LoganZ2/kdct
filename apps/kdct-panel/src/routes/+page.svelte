@@ -160,7 +160,7 @@
 
   <!-- Bridges -->
   <div class="section">
-    <div class="section-head"><h2>Bridges</h2><button class="ghost" onclick={() => showNewBridge = true}>+ New Bridge</button></div>
+    <div class="section-head"><h2>Bridges</h2><button class="primary" onclick={() => showNewBridge = true}>+ New Bridge</button></div>
     {#if bridges.length === 0}
       <div class="dim" style="text-align:center;padding:20px">No bridges yet. Bridges are port configuration templates.</div>
     {:else}
