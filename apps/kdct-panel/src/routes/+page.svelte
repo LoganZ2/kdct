@@ -175,7 +175,7 @@
           </tr>
           {#if expandedBridge === br.id && bridgeDetail}
             <tr><td colspan="3">
-              <BridgeDetail bridgeId={br.id} {bridgeDetail} {onlineNodes} onrefresh={() => refreshBridgeDetail(br.id)} />
+              <BridgeDetail bridgeId={br.id} {bridgeDetail} onlineNodes={online} onrefresh={() => refreshBridgeDetail(br.id)} />
             </td></tr>
           {/if}
         {/each}
