@@ -1,5 +1,4 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
-use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -21,19 +20,11 @@ use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
-#[cfg(feature = "noise")]
-use crate::transport::NoiseTransport;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use crate::transport::TlsTransport;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-use crate::transport::WebsocketTransport;
-
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
 pub async fn run_client(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
-    update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
         anyhow!(
@@ -44,34 +35,7 @@ pub async fn run_client(
     match config.transport.transport_type {
         TransportType::Tcp => {
             let mut client = Client::<TcpTransport>::from(config).await?;
-            client.run(shutdown_rx, update_rx).await
-        }
-        TransportType::Tls => {
-            #[cfg(any(feature = "native-tls", feature = "rustls"))]
-            {
-                let mut client = Client::<TlsTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
-            }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::helper::feature_neither_compile("native-tls", "rustls")
-        }
-        TransportType::Noise => {
-            #[cfg(feature = "noise")]
-            {
-                let mut client = Client::<NoiseTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
-            }
-            #[cfg(not(feature = "noise"))]
-            crate::helper::feature_not_compile("noise")
-        }
-        TransportType::Websocket => {
-            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-            {
-                let mut client = Client::<WebsocketTransport>::from(config).await?;
-                client.run(shutdown_rx, update_rx).await
-            }
-            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+            client.run(shutdown_rx).await
         }
     }
 }
@@ -99,7 +63,6 @@ impl<T: 'static + Transport> Client<T> {
     pub async fn run(
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
-        mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         let services: Vec<(String, ClientServiceConfig)> = if self.config.services.is_empty() {
             let hostname = get_hostname();
@@ -143,11 +106,6 @@ impl<T: 'static + Transport> Client<T> {
                     }
                     break;
                 },
-                e = update_rx.recv() => {
-                    if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
-                    }
-                }
             }
         }
 
@@ -156,27 +114,6 @@ impl<T: 'static + Transport> Client<T> {
         }
 
         Ok(())
-    }
-
-    async fn handle_hot_reload(&mut self, e: ConfigChange) {
-        match e {
-            ConfigChange::ClientChange(client_change) => match client_change {
-                ClientServiceChange::Add(cfg) => {
-                    let name = cfg.name.clone();
-                    let handle = ControlChannelHandle::new(
-                        cfg,
-                        self.config.remote_addr.clone(),
-                        self.transport.clone(),
-                        self.config.heartbeat_timeout,
-                    );
-                    let _ = self.service_handles.insert(name, handle);
-                }
-                ClientServiceChange::Delete(s) => {
-                    let _ = self.service_handles.remove(&s);
-                }
-            },
-            ignored => warn!("Ignored {:?} since running as a client", ignored),
-        }
     }
 }
 

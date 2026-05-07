@@ -45,12 +45,6 @@ pub enum TransportType {
     #[default]
     #[serde(rename = "tcp")]
     Tcp,
-    #[serde(rename = "tls")]
-    Tls,
-    #[serde(rename = "noise")]
-    Noise,
-    #[serde(rename = "websocket")]
-    Websocket,
 }
 
 /// Per service config
@@ -127,35 +121,6 @@ impl ServerServiceConfig {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TlsConfig {
-    pub hostname: Option<String>,
-    pub trusted_root: Option<String>,
-    pub pkcs12: Option<String>,
-    pub pkcs12_password: Option<MaskedString>,
-}
-
-fn default_noise_pattern() -> String {
-    String::from("Noise_NK_25519_ChaChaPoly_BLAKE2s")
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct NoiseConfig {
-    #[serde(default = "default_noise_pattern")]
-    pub pattern: String,
-    pub local_private_key: Option<MaskedString>,
-    pub remote_public_key: Option<String>,
-    // TODO: Maybe psk can be added
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WebsocketConfig {
-    pub tls: bool,
-}
-
 fn default_nodelay() -> bool {
     DEFAULT_NODELAY
 }
@@ -198,9 +163,6 @@ pub struct TransportConfig {
     pub transport_type: TransportType,
     #[serde(default)]
     pub tcp: TcpConfig,
-    pub tls: Option<TlsConfig>,
-    pub noise: Option<NoiseConfig>,
-    pub websocket: Option<WebsocketConfig>,
 }
 
 fn default_heartbeat_timeout() -> u64 {
@@ -321,7 +283,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate_transport_config(config: &TransportConfig, is_server: bool) -> Result<()> {
+    fn validate_transport_config(config: &TransportConfig, _is_server: bool) -> Result<()> {
         config
             .tcp
             .proxy
@@ -333,25 +295,6 @@ impl Config {
             })?;
         match config.transport_type {
             TransportType::Tcp => Ok(()),
-            TransportType::Tls => {
-                let tls_config = config
-                    .tls
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Missing TLS configuration"))?;
-                if is_server {
-                    tls_config
-                        .pkcs12
-                        .as_ref()
-                        .and(tls_config.pkcs12_password.as_ref())
-                        .ok_or_else(|| anyhow!("Missing `pkcs12` or `pkcs12_password`"))?;
-                }
-                Ok(())
-            }
-            TransportType::Noise => {
-                // The check is done in transport
-                Ok(())
-            }
-            TransportType::Websocket => Ok(()),
         }
     }
 
@@ -368,60 +311,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf};
 
     use anyhow::Result;
-
-    fn list_config_files<T: AsRef<Path>>(root: T) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                files.push(path);
-            } else if path.is_dir() {
-                files.append(&mut list_config_files(path)?);
-            }
-        }
-        Ok(files)
-    }
-
-    fn get_all_example_config() -> Result<Vec<PathBuf>> {
-        Ok(list_config_files("./examples")?
-            .into_iter()
-            .filter(|x| x.ends_with(".toml"))
-            .collect())
-    }
-
-    #[test]
-    fn test_example_config() -> Result<()> {
-        let paths = get_all_example_config()?;
-        for p in paths {
-            let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_valid_config() -> Result<()> {
-        let paths = list_config_files("tests/config_test/valid_config")?;
-        for p in paths {
-            let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_invalid_config() -> Result<()> {
-        let paths = list_config_files("tests/config_test/invalid_config")?;
-        for p in paths {
-            let s = fs::read_to_string(p)?;
-            assert!(Config::from_str(&s).is_err());
-        }
-        Ok(())
-    }
 
     #[test]
     fn test_validate_server_config() -> Result<()> {

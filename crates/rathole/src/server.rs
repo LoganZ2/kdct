@@ -1,5 +1,4 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
-use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::retry_notify_with_deadline;
 use crate::multi_map::MultiMap;
@@ -24,13 +23,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
-#[cfg(feature = "noise")]
-use crate::transport::NoiseTransport;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use crate::transport::TlsTransport;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-use crate::transport::WebsocketTransport;
-
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
@@ -42,7 +34,6 @@ const HANDSHAKE_TIMEOUT: u64 = 5;
 pub async fn run_server(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
-    update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
@@ -55,37 +46,7 @@ pub async fn run_server(
         TransportType::Tcp => {
             let (node_update_tx, _) = mpsc::channel(1024);
             let mut server = Server::<TcpTransport>::from(config, None, node_update_tx).await?;
-            server.run(shutdown_rx, update_rx).await?;
-        }
-        TransportType::Tls => {
-            #[cfg(any(feature = "native-tls", feature = "rustls"))]
-            {
-                let (node_update_tx, _) = mpsc::channel(1024);
-                let mut server = Server::<TlsTransport>::from(config, None, node_update_tx).await?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::helper::feature_neither_compile("native-tls", "rustls")
-        }
-        TransportType::Noise => {
-            #[cfg(feature = "noise")]
-            {
-                let (node_update_tx, _) = mpsc::channel(1024);
-                let mut server = Server::<NoiseTransport>::from(config, None, node_update_tx).await?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(feature = "noise"))]
-            crate::helper::feature_not_compile("noise")
-        }
-        TransportType::Websocket => {
-            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-            {
-                let (node_update_tx, _) = mpsc::channel(1024);
-                let mut server = Server::<WebsocketTransport>::from(config, None, node_update_tx).await?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+            server.run(shutdown_rx).await?;
         }
     }
 
@@ -139,7 +100,6 @@ impl<T: 'static + Transport> Server<T> {
     pub async fn run(
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
-        mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         let l = self
             .transport
@@ -203,40 +163,12 @@ impl<T: 'static + Transport> Server<T> {
                     info!("Shuting down gracefully...");
                     break;
                 },
-                e = update_rx.recv() => {
-                    if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
-                    }
-                }
             }
         }
 
         info!("Shutdown");
 
         Ok(())
-    }
-
-    async fn handle_hot_reload(&mut self, e: ConfigChange) {
-        match e {
-            ConfigChange::ServerChange(server_change) => match server_change {
-                ServerServiceChange::Add(cfg) => {
-                    let hash = protocol::digest(cfg.name.as_bytes());
-                    let mut wg = self.services.write().await;
-                    let _ = wg.insert(hash, cfg);
-
-                    let mut wg = self.control_channels.write().await;
-                    let _ = wg.remove1(&hash);
-                }
-                ServerServiceChange::Delete(s) => {
-                    let hash = protocol::digest(s.as_bytes());
-                    let _ = self.services.write().await.remove(&hash);
-
-                    let mut wg = self.control_channels.write().await;
-                    let _ = wg.remove1(&hash);
-                }
-            },
-            ignored => warn!("Ignored {:?} since running as a server", ignored),
-        }
     }
 }
 

@@ -227,7 +227,6 @@ async fn run_client(config_path: PathBuf, shutdown: oneshot::Receiver<()>) -> Re
                 config_path: Some(config_path),
                 server: false,
                 client: true,
-                genkey: None,
             },
             shutdown_rx,
         )

@@ -6,7 +6,7 @@ mod interactive;
 mod node;
 mod proxy;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use rathole::config::{Config, TransportType};
 use rathole::port_pool::PortPool;
@@ -294,17 +294,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 }
             });
 
-            let (_tx, update_rx) = tokio::sync::mpsc::channel(1);
-            server.run(shutdown_rx, update_rx).await?;
+            server.run(shutdown_rx).await?;
             drop(shutdown_tx);
             Ok(())
-        }
-        other => {
-            bail!(
-                "Transport type {:?} requires specific crate features. \
-                 Use TCP for now, or rebuild with the required features.",
-                other
-            );
         }
     }
 }

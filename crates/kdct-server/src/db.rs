@@ -10,6 +10,7 @@ pub struct Database {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ImageNode {
     pub id: i64,
     pub name: String,
@@ -20,6 +21,7 @@ pub struct ImageNode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ImagePort {
     pub id: i64,
     pub image_node_id: i64,
@@ -28,13 +30,7 @@ pub struct ImagePort {
 }
 
 #[derive(Debug, Clone)]
-pub struct ImageRoute {
-    pub id: i64,
-    pub image_port_id: i64,
-    pub path: String,
-}
-
-#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ClientNode {
     pub id: i64,
     pub hostname: String,
@@ -51,6 +47,7 @@ pub struct ClientNode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Deployment {
     pub id: i64,
     pub image_node_id: i64,
@@ -60,6 +57,7 @@ pub struct Deployment {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PortAllocation {
     pub id: i64,
     pub deployment_id: i64,
@@ -319,15 +317,6 @@ impl Database {
              cpu_cores=excluded.cpu_cores, memory_mb=excluded.memory_mb, \
              status='online', last_seen=strftime('%s','now')",
             params![hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, auth_digest],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_node_offline(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE client_nodes SET status='offline' WHERE id=?1",
-            params![id],
         )?;
         Ok(())
     }

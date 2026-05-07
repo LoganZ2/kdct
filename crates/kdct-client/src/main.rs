@@ -30,7 +30,6 @@ async fn main() -> Result<()> {
             config_path: Some(cli.config),
             server: false,
             client: true,
-            genkey: None,
         },
         shutdown_rx,
     )

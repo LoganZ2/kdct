@@ -6,13 +6,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-/// Logical route entry.
-#[derive(Debug, Clone)]
-pub struct Route {
-    pub path: String,
-    pub port: u16,
-}
-
 /// RouteTable maps path → localhost port (rathole tunnel endpoint).
 #[derive(Debug, Clone, Default)]
 pub struct RouteTable {
@@ -33,11 +26,6 @@ impl RouteTable {
         self.routes.insert(path.to_string(), port);
         info!("Route added: {} → localhost:{}", path, port);
         Ok(())
-    }
-
-    pub fn remove(&mut self, path: &str) {
-        self.routes.remove(path);
-        info!("Route removed: {}", path);
     }
 
     pub fn remove_by_port(&mut self, port: u16) {
@@ -63,16 +51,6 @@ impl RouteTable {
             }
         }
         best.map(|(_, p)| p)
-    }
-
-    pub fn dump(&self) -> Vec<Route> {
-        self.routes
-            .iter()
-            .map(|(path, &port)| Route {
-                path: path.clone(),
-                port,
-            })
-            .collect()
     }
 }
 
