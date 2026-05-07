@@ -1,10 +1,9 @@
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
-
-  let { bridgeId, detail, onlineNodes }: {
+  let { bridgeId, detail, onlineNodes = [], onrefresh = () => {} }: {
     bridgeId: number;
     detail: any;
-    onlineNodes: any[];
+    onlineNodes?: any[];
+    onrefresh?: () => void;
   } = $props();
 
   let portContainerPort = $state(0);
@@ -19,8 +18,6 @@
   let addingEnv = $state(false);
   let envMsg = $state('');
 
-  const dispatch = createEventDispatcher();
-
   async function addPort() {
     if (!portContainerPort) return;
     if (portMode === 'route' && !portRoutePath.startsWith('/')) { portMsg = 'Path must start with /'; return; }
@@ -34,14 +31,14 @@
       });
       if (res.ok) {
         portContainerPort = 0; portRoutePath = ''; addingPort = false; portProtocols = ['tcp'];
-        dispatch('refresh');
+        onrefresh();
       } else { portMsg = await res.text(); }
     } catch (e: any) { portMsg = e.message; }
   }
 
   async function deletePort(containerPort: number) {
     await fetch(`/api/bridges/${bridgeId}/port/${containerPort}`, { method: 'DELETE' });
-    dispatch('refresh');
+    onrefresh();
   }
 
   async function addEnv() {
@@ -54,7 +51,7 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });
-      if (res.ok) { envKey = ''; envVal = ''; addingEnv = false; dispatch('refresh'); }
+      if (res.ok) { envKey = ''; envVal = ''; addingEnv = false; onrefresh(); }
       else { envMsg = await res.text(); }
     } catch (e: any) { envMsg = e.message; }
   }
@@ -67,7 +64,7 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });
-      dispatch('refresh');
+      onrefresh();
     } catch {}
   }
 </script>
