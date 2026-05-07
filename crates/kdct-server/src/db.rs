@@ -21,12 +21,13 @@ pub struct ImageNode {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ImagePort {
+pub struct BridgePort {
     pub id: i64,
-    pub image_node_id: i64,
-    pub port: i64,
-    pub protocol: String,
+    pub bridge_id: i64,
+    pub container_port: i64,
+    pub mode: String,
+    pub route_path: Option<String>,
+    pub protocols: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,28 +78,33 @@ impl Database {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
-            CREATE TABLE IF NOT EXISTS image_ports (
+            CREATE TABLE IF NOT EXISTS bridges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
                 image_node_id INTEGER NOT NULL,
-                port INTEGER NOT NULL,
-                protocol TEXT NOT NULL DEFAULT 'tcp',
-                FOREIGN KEY (image_node_id) REFERENCES image_nodes(id) ON DELETE CASCADE
+                status TEXT NOT NULL DEFAULT 'draft',
+                node_id INTEGER,
+                FOREIGN KEY (image_node_id) REFERENCES image_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY (node_id) REFERENCES client_nodes(id) ON DELETE SET NULL
             );
 
-            CREATE TABLE IF NOT EXISTS image_routes (
+            CREATE TABLE IF NOT EXISTS bridge_ports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                image_port_id INTEGER NOT NULL UNIQUE,
-                path TEXT NOT NULL,
-                FOREIGN KEY (image_port_id) REFERENCES image_ports(id) ON DELETE CASCADE
+                bridge_id INTEGER NOT NULL,
+                container_port INTEGER NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'route',
+                route_path TEXT,
+                protocols TEXT,
+                FOREIGN KEY (bridge_id) REFERENCES bridges(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS image_envs (
+            CREATE TABLE IF NOT EXISTS bridge_envs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                image_node_id INTEGER NOT NULL,
+                bridge_id INTEGER NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
-                FOREIGN KEY (image_node_id) REFERENCES image_nodes(id) ON DELETE CASCADE,
-                UNIQUE(image_node_id, key)
+                FOREIGN KEY (bridge_id) REFERENCES bridges(id) ON DELETE CASCADE,
+                UNIQUE(bridge_id, key)
             );
 
             CREATE TABLE IF NOT EXISTS client_nodes (
@@ -174,79 +180,147 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn insert_image_port(&self, image_node_id: i64, port: i64, protocol: &str) -> Result<i64> {
+    // ── Bridge operations ─────────────────────────────────────
+
+    pub fn insert_bridge(&self, name: &str, image_node_id: i64) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO image_ports (image_node_id, port, protocol) VALUES (?1, ?2, ?3)",
-            params![image_node_id, port, protocol],
+            "INSERT INTO bridges (name, image_node_id, status) VALUES (?1, ?2, 'draft')",
+            params![name, image_node_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn get_image_ports(&self, image_node_id: i64) -> Result<Vec<ImagePort>> {
+    pub fn list_bridges(&self) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, image_node_id, port, protocol FROM image_ports WHERE image_node_id=?1 ORDER BY port",
+            "SELECT b.id, b.name, b.image_node_id, b.status, b.node_id, i.name as image_name \
+             FROM bridges b JOIN image_nodes i ON b.image_node_id = i.id ORDER BY b.id DESC",
         )?;
-        let rows = stmt.query_map(params![image_node_id], |row| {
-            Ok(ImagePort {
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "image_node_id": row.get::<_, i64>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "node_id": row.get::<_, Option<i64>>(4)?,
+                "image_name": row.get::<_, String>(5)?,
+            }))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_bridge_by_id(&self, bridge_id: i64) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT b.id, b.name, b.image_node_id, b.status, b.node_id, i.name as image_name \
+             FROM bridges b JOIN image_nodes i ON b.image_node_id = i.id WHERE b.id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![bridge_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "image_node_id": row.get::<_, i64>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "node_id": row.get::<_, Option<i64>>(4)?,
+                "image_name": row.get::<_, String>(5)?,
+            }))
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_bridge(&self, bridge_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM bridges WHERE id=?1", params![bridge_id])?;
+        Ok(())
+    }
+
+    pub fn update_bridge_status(&self, bridge_id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE bridges SET status=?1 WHERE id=?2", params![status, bridge_id])?;
+        Ok(())
+    }
+
+    pub fn update_bridge_node(&self, bridge_id: i64, node_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE bridges SET node_id=?1, status='deployed' WHERE id=?2",
+            params![node_id, bridge_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_bridge_node(&self, bridge_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE bridges SET node_id=NULL, status='draft' WHERE id=?1",
+            params![bridge_id],
+        )?;
+        Ok(())
+    }
+
+    // ── Bridge ports ──────────────────────────────────────────
+
+    pub fn insert_bridge_port(&self, bridge_id: i64, container_port: i64, mode: &str, route_path: Option<&str>, protocols: Option<&str>) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO bridge_ports (bridge_id, container_port, mode, route_path, protocols) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![bridge_id, container_port, mode, route_path, protocols],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_bridge_ports(&self, bridge_id: i64) -> Result<Vec<BridgePort>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, bridge_id, container_port, mode, route_path, protocols FROM bridge_ports WHERE bridge_id=?1 ORDER BY container_port",
+        )?;
+        let rows = stmt.query_map(params![bridge_id], |row| {
+            Ok(BridgePort {
                 id: row.get(0)?,
-                image_node_id: row.get(1)?,
-                port: row.get(2)?,
-                protocol: row.get(3)?,
+                bridge_id: row.get(1)?,
+                container_port: row.get(2)?,
+                mode: row.get(3)?,
+                route_path: row.get(4)?,
+                protocols: row.get(5)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn set_image_route(&self, image_port_id: i64, path: &str) -> Result<()> {
+    pub fn delete_bridge_port(&self, bridge_id: i64, container_port: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO image_routes (image_port_id, path) VALUES (?1, ?2)",
-            params![image_port_id, path],
+            "DELETE FROM bridge_ports WHERE bridge_id=?1 AND container_port=?2",
+            params![bridge_id, container_port],
         )?;
         Ok(())
     }
 
-    pub fn get_image_routes(&self, image_node_id: i64) -> Result<Vec<(ImagePort, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT p.id, p.image_node_id, p.port, p.protocol, r.path \
-             FROM image_ports p LEFT JOIN image_routes r ON p.id = r.image_port_id \
-             WHERE p.image_node_id=?1 ORDER BY p.port",
-        )?;
-        let rows = stmt.query_map(params![image_node_id], |row| {
-            Ok((
-                ImagePort {
-                    id: row.get(0)?,
-                    image_node_id: row.get(1)?,
-                    port: row.get(2)?,
-                    protocol: row.get(3)?,
-                },
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
-    }
+    // ── Bridge envs ───────────────────────────────────────────
 
-    pub fn set_image_envs(&self, image_node_id: i64, envs: &[(String, String)]) -> Result<()> {
+    pub fn set_bridge_envs(&self, bridge_id: i64, envs: &[(String, String)]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM image_envs WHERE image_node_id=?1", params![image_node_id])?;
+        conn.execute("DELETE FROM bridge_envs WHERE bridge_id=?1", params![bridge_id])?;
         for (k, v) in envs {
             conn.execute(
-                "INSERT INTO image_envs (image_node_id, key, value) VALUES (?1, ?2, ?3)",
-                params![image_node_id, k, v],
+                "INSERT INTO bridge_envs (bridge_id, key, value) VALUES (?1, ?2, ?3)",
+                params![bridge_id, k, v],
             )?;
         }
         Ok(())
     }
 
-    pub fn get_image_envs(&self, image_node_id: i64) -> Result<Vec<(String, String)>> {
+    pub fn get_bridge_envs(&self, bridge_id: i64) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT key, value FROM image_envs WHERE image_node_id=?1 ORDER BY key",
+            "SELECT key, value FROM bridge_envs WHERE bridge_id=?1 ORDER BY key",
         )?;
-        let rows = stmt.query_map(params![image_node_id], |row| {
+        let rows = stmt.query_map(params![bridge_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)

@@ -54,6 +54,10 @@ pub async fn run_api(
     info!("Panel API listening on http://127.0.0.1:{}", API_PORT);
     info!("Serving panel from: {}", panel.display());
 
+    // Track active port accept loops for graceful shutdown
+    let active_forwards: Arc<RwLock<Vec<(u16, tokio::sync::broadcast::Sender<bool>)>>> =
+        Arc::new(RwLock::new(Vec::new()));
+
     tokio::task::spawn_blocking(move || {
         loop {
             let mut request = match server.recv() {
@@ -72,6 +76,7 @@ pub async fn run_api(
             let handle = Handle::current();
 
             let response = match (method, path.as_str()) {
+                // ── Nodes ────────────────────────────────────────
                 (&tiny_http::Method::Get, "/api/nodes") => {
                     match db.list_nodes() {
                         Ok(nodes) => {
@@ -94,6 +99,7 @@ pub async fn run_api(
                     }
                 }
 
+                // ── Images ───────────────────────────────────────
                 (&tiny_http::Method::Get, "/api/images") => {
                     match db.list_images() {
                         Ok(images) => {
@@ -114,68 +120,74 @@ pub async fn run_api(
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/images/") => {
                     let name = &p["/api/images/".len()..];
                     let name = percent_decode(name);
-                    let img = match db.get_image_by_name(&name) {
-                        Ok(Some(i)) => i,
-                        Ok(None) => return error_json("Image not found", 404),
+                    match db.get_image_by_name(&name) {
+                        Ok(Some(img)) => respond_json(&json!({
+                            "id": img.id,
+                            "name": img.name,
+                            "source": img.source,
+                            "source_type": img.source_type,
+                            "status": img.status,
+                            "created_at": img.created_at,
+                        })),
+                        Ok(None) => error_json("Image not found", 404),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                // ── Bridges ──────────────────────────────────────
+                (&tiny_http::Method::Get, "/api/bridges") => {
+                    match db.list_bridges() {
+                        Ok(list) => respond_json(&json!(list)),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Get, p) if p.starts_with("/api/bridges/") => {
+                    let rest = &p["/api/bridges/".len()..];
+                    let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
+                    let bridge_id: i64 = match id_str.parse() {
+                        Ok(id) => id,
+                        Err(_) => return error_json("Invalid bridge id", 400),
+                    };
+                    let bridge = match db.get_bridge_by_id(bridge_id) {
+                        Ok(Some(b)) => b,
+                        Ok(None) => return error_json("Bridge not found", 404),
                         Err(e) => return error_json(&format!("{}", e), 500),
                     };
-                    let ports = db.get_image_routes(img.id).unwrap_or_default();
-                    let envs = db.get_image_envs(img.id).unwrap_or_default();
+                    let ports = db.get_bridge_ports(bridge_id).unwrap_or_default();
+                    let envs = db.get_bridge_envs(bridge_id).unwrap_or_default();
+                    let port_list: Vec<serde_json::Value> = ports.iter().map(|p| json!({
+                        "id": p.id,
+                        "container_port": p.container_port,
+                        "mode": p.mode,
+                        "route_path": p.route_path,
+                        "protocols": p.protocols,
+                    })).collect();
+                    let env_list: Vec<serde_json::Value> = envs.iter().map(|(k, v)| json!({
+                        "key": k, "value": v,
+                    })).collect();
 
-                    let mut all_routed = true;
-                    let mut missing_ports: Vec<i64> = Vec::new();
-                    let mut conflict_paths: Vec<String> = Vec::new();
-
-                    {
+                    // Deploy validation
+                    let mut deployable = !ports.is_empty();
+                    let mut deploy_error: Option<String> = None;
+                    if ports.is_empty() {
+                        deployable = false;
+                        deploy_error = Some("No ports configured".into());
+                    } else {
                         let rt = handle.block_on(route_table.read());
-                        for (p, route) in &ports {
-                            match route {
-                                Some(ref path) => {
-                                    if rt.resolve(path).is_some() {
-                                        conflict_paths.push(path.clone());
-                                        all_routed = false;
-                                    }
-                                }
-                                None => {
-                                    missing_ports.push(p.port);
-                                    all_routed = false;
+                        for p in &ports {
+                            if let Some(ref path) = p.route_path {
+                                if rt.resolve(path).is_some() {
+                                    deployable = false;
+                                    deploy_error = Some(format!("Route '{}' already in use", path));
+                                    break;
                                 }
                             }
                         }
                     }
 
-                    let port_list: Vec<serde_json::Value> = ports.iter().map(|(p, route)| json!({
-                        "id": p.id,
-                        "image_node_id": p.image_node_id,
-                        "port": p.port,
-                        "protocol": p.protocol,
-                        "route_path": route,
-                    })).collect();
-                    let env_list: Vec<serde_json::Value> = envs.iter().map(|(k, v)| json!({
-                        "key": k,
-                        "value": v,
-                    })).collect();
-
-                    let deployable = all_routed && ports.len() > 0;
-                    let deploy_error = if !deployable {
-                        if !missing_ports.is_empty() {
-                            Some(format!("Ports without routes: {:?}", missing_ports))
-                        } else if !conflict_paths.is_empty() {
-                            Some(format!("Route conflicts: {:?}", conflict_paths))
-                        } else {
-                            Some("No ports configured".to_string())
-                        }
-                    } else {
-                        None
-                    };
-
                     respond_json(&json!({
-                        "id": img.id,
-                        "name": img.name,
-                        "source": img.source,
-                        "source_type": img.source_type,
-                        "status": img.status,
-                        "created_at": img.created_at,
+                        "bridge": bridge,
                         "ports": port_list,
                         "envs": env_list,
                         "deployable": deployable,
@@ -183,6 +195,200 @@ pub async fn run_api(
                     }))
                 }
 
+                (&tiny_http::Method::Post, "/api/bridges") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let bridge_name = parsed["name"].as_str().unwrap_or("");
+                    let image_name = parsed["image"].as_str().unwrap_or("");
+                    if bridge_name.is_empty() || image_name.is_empty() {
+                        return error_json("Missing 'name' or 'image'", 400);
+                    }
+                    let img = match db.get_image_by_name(image_name) {
+                        Ok(Some(i)) => i,
+                        Ok(None) => return error_json("Image not found", 404),
+                        Err(e) => return error_json(&format!("{}", e), 500),
+                    };
+                    match db.insert_bridge(bridge_name, img.id) {
+                        Ok(id) => respond_json(&json!({"id": id, "name": bridge_name})),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Delete, p) if p.starts_with("/api/bridges/") => {
+                    let rest = &p["/api/bridges/".len()..];
+                    let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
+                    let bridge_id: i64 = match id_str.parse() {
+                        Ok(id) => id,
+                        Err(_) => return error_json("Invalid bridge id", 400),
+                    };
+                    match db.delete_bridge(bridge_id) {
+                        Ok(_) => respond_json(&json!({"ok": true})),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Post, p) if p.ends_with("/port") => {
+                    let bridge_id = extract_bridge_id(p, "/port");
+                    let bridge_id = match bridge_id {
+                        Some(id) => id,
+                        None => return error_json("Invalid bridge id", 400),
+                    };
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let container_port = parsed["container_port"].as_i64().unwrap_or(0);
+                    let mode = parsed["mode"].as_str().unwrap_or("route");
+                    let route_path = parsed["route_path"].as_str();
+                    let protocols = parsed["protocols"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","));
+                    let protocols_str = protocols.as_deref();
+                    if container_port == 0 || (mode == "route" && route_path.is_none()) {
+                        return error_json("Missing 'container_port' or 'route_path'", 400);
+                    }
+                    match db.insert_bridge_port(bridge_id, container_port, mode, route_path, protocols_str) {
+                        Ok(_) => respond_json(&json!({"ok": true})),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Delete, p) if p.contains("/port/") => {
+                    // /api/bridges/:id/port/:container_port
+                    let rest = &p["/api/bridges/".len()..];
+                    let parts: Vec<&str> = rest.split('/').collect();
+                    if parts.len() < 3 {
+                        return error_json("Invalid path", 400);
+                    }
+                    let bridge_id: i64 = match parts[0].parse() {
+                        Ok(id) => id,
+                        Err(_) => return error_json("Invalid bridge id", 400),
+                    };
+                    let container_port: i64 = match parts[2].parse() {
+                        Ok(p) => p,
+                        Err(_) => return error_json("Invalid port", 400),
+                    };
+                    match db.delete_bridge_port(bridge_id, container_port) {
+                        Ok(_) => respond_json(&json!({"ok": true})),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Post, p) if p.ends_with("/env") => {
+                    let bridge_id = extract_bridge_id(p, "/env");
+                    let bridge_id = match bridge_id {
+                        Some(id) => id,
+                        None => return error_json("Invalid bridge id", 400),
+                    };
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let envs = parsed["envs"].as_array();
+                    if envs.is_none() {
+                        return error_json("Missing 'envs' array", 400);
+                    }
+                    let pairs: Vec<(String, String)> = envs.unwrap().iter().filter_map(|e| {
+                        let key = e["key"].as_str()?;
+                        let value = e["value"].as_str()?;
+                        Some((key.to_string(), value.to_string()))
+                    }).collect();
+                    match db.set_bridge_envs(bridge_id, &pairs) {
+                        Ok(_) => respond_json(&json!({"ok": true})),
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Post, p) if p.ends_with("/deploy") => {
+                    let bridge_id = extract_bridge_id(p, "/deploy");
+                    let bridge_id = match bridge_id {
+                        Some(id) => id,
+                        None => return error_json("Invalid bridge id", 400),
+                    };
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let node_id = parsed["node_id"].as_i64().unwrap_or(0);
+                    if node_id == 0 {
+                        return error_json("Missing 'node_id'", 400);
+                    }
+                    let db2 = db.clone();
+                    let registry2 = registry.clone();
+                    let rt2 = route_table.clone();
+                    let pool2 = pool.clone();
+                    let tracker2 = tracker.clone();
+                    let fw2 = active_forwards.clone();
+                    let result = handle.block_on(async move {
+                        deploy::deploy_bridge(
+                            db2.as_ref(), &registry2, &rt2, &pool2, &tracker2, bridge_id, node_id, &fw2,
+                        ).await
+                    });
+                    match result {
+                        Ok(msg) => tiny_http::Response::from_string(msg),
+                        Err(e) => error_json(&format!("{:#}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Post, p) if p.ends_with("/stop") => {
+                    let bridge_id = extract_bridge_id(p, "/stop");
+                    let bridge_id = match bridge_id {
+                        Some(id) => id,
+                        None => return error_json("Invalid bridge id", 400),
+                    };
+                    let db2 = db.clone();
+                    let registry2 = registry.clone();
+                    let rt2 = route_table.clone();
+                    let pool2 = pool.clone();
+                    let tracker2 = tracker.clone();
+                    let fw2 = active_forwards.clone();
+                    let result = handle.block_on(async move {
+                        deploy::stop_bridge(
+                            db2.as_ref(), &registry2, &rt2, &pool2, &tracker2, bridge_id, &fw2,
+                        ).await
+                    });
+                    match result {
+                        Ok(msg) => tiny_http::Response::from_string(msg),
+                        Err(e) => error_json(&format!("{:#}", e), 500),
+                    }
+                }
+
+                // ── Image ports inspection ──────────────────────
+                (&tiny_http::Method::Get, p) if p.starts_with("/api/image/ports") => {
+                    let query = raw_path.split('?').nth(1).and_then(|qs| {
+                        qs.split('&').find_map(|pair| {
+                            let mut kv = pair.splitn(2, '=');
+                            if kv.next()? == "image" { kv.next().map(|s| s.to_string()) } else { None }
+                        })
+                    }).unwrap_or_default();
+                    if query.is_empty() {
+                        respond_json(&json!([]))
+                    } else {
+                        match handle.block_on(image::inspect_exposed_ports(&query)) {
+                            Ok(ports) => respond_json(&json!(ports)),
+                            Err(e) => error_json(&format!("{:#}", e), 500),
+                        }
+                    }
+                }
+
+                // ── Deployments ──────────────────────────────────
                 (&tiny_http::Method::Get, "/api/deployments") => {
                     let guard = handle.block_on(registry.read());
                     let mut list = Vec::new();
@@ -200,23 +406,31 @@ pub async fn run_api(
                     respond_json(&json!(list))
                 }
 
+                // ── Overview + port pool stats ──────────────────
                 (&tiny_http::Method::Get, "/api/overview") => {
                     let nodes = db.list_nodes().unwrap_or_default();
                     let images = db.list_images().unwrap_or_default();
+                    let bridges = db.list_bridges().unwrap_or_default();
                     let online = nodes.iter().filter(|n| n.status == "online").count();
-                    let configured = images.iter().filter(|i| i.status == "configured").count();
+                    let bridge_count = bridges.len();
+                    let deployed_count = bridges.iter().filter(|b| b["status"].as_str() == Some("deployed")).count();
 
                     let guard = handle.block_on(registry.read());
                     let container_count: usize = guard.iter().map(|(_, e)| e.running_containers.len()).sum();
                     drop(guard);
 
+                    let pool_total = pool.total();
+                    let pool_free = handle.block_on(pool.free_count());
+
                     respond_json(&json!({
                         "node_count": nodes.len(),
                         "online_count": online,
                         "image_count": images.len(),
-                        "configured_count": configured,
-                        "deployment_count": 0,
+                        "bridge_count": bridge_count,
+                        "deployed_count": deployed_count,
                         "container_count": container_count,
+                        "pool_total": pool_total,
+                        "pool_free": pool_free,
                     }))
                 }
 
@@ -224,6 +438,7 @@ pub async fn run_api(
                     respond_json(&json!({"ok": true}))
                 }
 
+                // ── Docker Hub search ────────────────────────────
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/search") => {
                     let query = raw_path.split('?').nth(1).and_then(|qs| {
                         qs.split('&').find_map(|pair| {
@@ -241,6 +456,7 @@ pub async fn run_api(
                     }
                 }
 
+                // ── Docker Hub tags ──────────────────────────────
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/tags") => {
                     let params: HashMap<String, String> = raw_path.split('?').nth(1).map(|qs| {
                         qs.split('&').filter_map(|pair| {
@@ -260,6 +476,7 @@ pub async fn run_api(
                     }
                 }
 
+                // ── Image load ───────────────────────────────────
                 (&tiny_http::Method::Post, "/api/image/load") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -306,7 +523,6 @@ pub async fn run_api(
 
                         log_line(&format!("Pulling: {}", source));
 
-                        // For docker_hub: stream docker pull
                         let is_docker = !(source.starts_with("http") || source.ends_with(".git"));
                         if is_docker {
                             match tokio::process::Command::new("docker")
@@ -321,9 +537,7 @@ pub async fn run_api(
                                         let mut lines = reader.lines();
                                         while let Ok(Some(line)) = lines.next_line().await {
                                             let trimmed = line.trim().to_string();
-                                            if !trimmed.is_empty() {
-                                                log_line(&trimmed);
-                                            }
+                                            if !trimmed.is_empty() { log_line(&trimmed); }
                                         }
                                     }
                                     let status = child.wait().await;
@@ -346,7 +560,6 @@ pub async fn run_api(
                             }
                         }
 
-                        // Run image::load_image for inspect + DB insert
                         match image::load_image(db.as_ref(), &source, custom_name.as_deref()).await {
                             Ok(name) => {
                                 if let Ok(mut j) = jobs.lock() {
@@ -378,7 +591,6 @@ pub async fn run_api(
                             if kv.next()? == "job" { kv.next().map(|s| s.to_string()) } else { None }
                         })
                     }).unwrap_or_default();
-
                     let jobs = job_registry.lock().unwrap();
                     match jobs.get(&job_id) {
                         Some(job) => respond_json(&json!({
@@ -390,150 +602,8 @@ pub async fn run_api(
                     }
                 }
 
-                (&tiny_http::Method::Post, "/api/image/route") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        return error_json("Failed to read body", 400);
-                    }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(v) => v,
-                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
-                    };
-                    let image_name = parsed["image"].as_str().unwrap_or("");
-                    let port = parsed["port"].as_i64().unwrap_or(0);
-                    let path = parsed["path"].as_str().unwrap_or("");
-                    if image_name.is_empty() || port == 0 || path.is_empty() {
-                        return error_json("Missing 'image', 'port', or 'path'", 400);
-                    }
-                    let db2 = db.clone();
-                    let image_name = image_name.to_string();
-                    let path = path.to_string();
-                    match handle.block_on(async move {
-                        image::configure_route(db2.as_ref(), &image_name, port, &path).await
-                    }) {
-                        Ok(_) => tiny_http::Response::from_string("Route configured"),
-                        Err(e) => error_json(&format!("{:#}", e), 500),
-                    }
-                }
-
-                (&tiny_http::Method::Post, "/api/image/env") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        return error_json("Failed to read body", 400);
-                    }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(v) => v,
-                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
-                    };
-                    let image_name = parsed["image"].as_str().unwrap_or("");
-                    let envs = parsed["envs"].as_array();
-                    if image_name.is_empty() || envs.is_none() {
-                        return error_json("Missing 'image' or 'envs' array", 400);
-                    }
-                    let pairs: Vec<(String, String)> = envs.unwrap().iter().filter_map(|e| {
-                        let key = e["key"].as_str()?;
-                        let value = e["value"].as_str()?;
-                        Some((key.to_string(), value.to_string()))
-                    }).collect();
-                    let db2 = db.clone();
-                    let image_name = image_name.to_string();
-                    match handle.block_on(async move {
-                        let img = db2.get_image_by_name(&image_name)?.ok_or_else(|| anyhow::anyhow!("Image not found"))?;
-                        db2.set_image_envs(img.id, &pairs)?;
-                        db2.update_image_status(img.id, "configured")?;
-                        Ok::<_, anyhow::Error>(())
-                    }) {
-                        Ok(_) => tiny_http::Response::from_string("Environment configured"),
-                        Err(e) => error_json(&format!("{:#}", e), 500),
-                    }
-                }
-
-                (&tiny_http::Method::Post, "/api/deploy") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        return error_json("Failed to read body", 400);
-                    }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(v) => v,
-                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
-                    };
-                    let image = parsed["image"].as_str().unwrap_or("");
-                    let node_id = parsed["node_id"].as_i64().unwrap_or(0);
-                    if image.is_empty() || node_id == 0 {
-                        return error_json("Missing 'image' or 'node_id'", 400);
-                    }
-
-                    let db2 = db.clone();
-                    let registry2 = registry.clone();
-                    let rt2 = route_table.clone();
-                    let pool2 = pool.clone();
-                    let tracker2 = tracker.clone();
-                    let dr2 = docker_results.clone();
-                    let image = image.to_string();
-
-                    let result = handle.block_on(async move {
-                        deploy::deploy_image(
-                            db2.as_ref(),
-                            &registry2,
-                            &rt2,
-                            &pool2,
-                            &tracker2,
-                            &dr2,
-                            &image,
-                            node_id,
-                        ).await
-                    });
-
-                    match result {
-                        Ok(msg) => tiny_http::Response::from_string(msg),
-                        Err(e) => error_json(&format!("{:#}", e), 500),
-                    }
-                }
-
-                (&tiny_http::Method::Post, "/api/stop") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        return error_json("Failed to read body", 400);
-                    }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(v) => v,
-                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
-                    };
-                    let image = parsed["image"].as_str().unwrap_or("");
-                    let node_id = parsed["node_id"].as_i64().unwrap_or(0);
-                    if image.is_empty() || node_id == 0 {
-                        return error_json("Missing 'image' or 'node_id'", 400);
-                    }
-
-                    let db2 = db.clone();
-                    let registry2 = registry.clone();
-                    let rt2 = route_table.clone();
-                    let pool2 = pool.clone();
-                    let tracker2 = tracker.clone();
-                    let dr2 = docker_results.clone();
-                    let image = image.to_string();
-
-                    let result = handle.block_on(async move {
-                        deploy::stop_image(
-                            db2.as_ref(),
-                            &registry2,
-                            &rt2,
-                            &pool2,
-                            &tracker2,
-                            &dr2,
-                            &image,
-                            node_id,
-                        ).await
-                    });
-
-                    match result {
-                        Ok(msg) => tiny_http::Response::from_string(msg),
-                        Err(e) => error_json(&format!("{:#}", e), 500),
-                    }
-                }
-
                 _ => {
-                    serve_static(&panel, &path, handle.clone(), &registry)
+                    serve_static(&panel, &path, &registry)
                 }
             };
 
@@ -546,6 +616,11 @@ pub async fn run_api(
     Ok(())
 }
 
+fn extract_bridge_id(path: &str, suffix: &str) -> Option<i64> {
+    let strip = path.strip_prefix("/api/bridges/")?.strip_suffix(suffix)?;
+    strip.parse().ok()
+}
+
 fn respond_json(data: &serde_json::Value) -> Resp {
     let body = data.to_string();
     tiny_http::Response::from_string(body)
@@ -555,47 +630,38 @@ fn respond_json(data: &serde_json::Value) -> Resp {
 fn error_json(msg: &str, code: u16) -> Resp {
     let body = json!({"error": msg}).to_string();
     let code = tiny_http::StatusCode(match code {
-        400 => 400,
-        404 => 404,
-        _ => 500,
+        400 => 400, 404 => 404, _ => 500,
     });
     tiny_http::Response::from_string(body)
         .with_status_code(code)
         .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())
 }
 
-fn serve_static(panel_dir: &PathBuf, path: &str, _handle: Handle, _registry: &ClientRegistry) -> Resp {
+fn serve_static(panel_dir: &PathBuf, path: &str, _registry: &ClientRegistry) -> Resp {
     let path = path.trim_start_matches('/');
-
     if path.is_empty() {
         return serve_file_or_fallback(panel_dir, "index.html");
     }
-
     let file_path = panel_dir.join(path);
     if file_path.exists() && file_path.is_file() {
         return serve_file(&file_path, path);
     }
-
     let html_path = panel_dir.join(format!("{}.html", path));
     if html_path.exists() {
         return serve_file(&html_path, &format!("{}.html", path));
     }
-
     let index_path = panel_dir.join(path).join("index.html");
     if index_path.exists() {
         return serve_file(&index_path, "index.html");
     }
-
     serve_file_or_fallback(panel_dir, "index.html")
 }
 
 fn serve_file_or_fallback(panel_dir: &PathBuf, name: &str) -> Resp {
     let file_path = panel_dir.join(name);
     match std::fs::read(&file_path) {
-        Ok(data) => {
-            tiny_http::Response::from_data(data)
-                .with_header(tiny_http::Header::from_bytes("Content-Type", "text/html").unwrap())
-        }
+        Ok(data) => tiny_http::Response::from_data(data)
+            .with_header(tiny_http::Header::from_bytes("Content-Type", "text/html").unwrap()),
         Err(_) => tiny_http::Response::from_string("Not Found")
             .with_status_code(tiny_http::StatusCode(404)),
     }
@@ -644,10 +710,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn search_docker_hub(query: &str) -> Result<Vec<serde_json::Value>> {
-    let url = format!(
-        "https://hub.docker.com/v2/search/repositories/?query={}&page_size=15",
-        urlencoding(query)
-    );
+    let url = format!("https://hub.docker.com/v2/search/repositories/?query={}&page_size=15", urlencoding(query));
     let resp: ureq::Response = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(5))
         .timeout_read(std::time::Duration::from_secs(5))
@@ -657,33 +720,19 @@ fn search_docker_hub(query: &str) -> Result<Vec<serde_json::Value>> {
         .set("Accept", "application/json")
         .call()
         .map_err(|e| anyhow::anyhow!("Docker Hub request failed: {}", e))?;
-
-    let body = resp
-        .into_string()
-        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("Invalid response: {}", e))?;
-
-    let results_list = parsed["results"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    let results: Vec<serde_json::Value> = results_list
-        .iter()
-        .filter_map(|r| {
-            let name = r["repo_name"].as_str()?;
-            Some(json!({
-                "name": name,
-                "description": r["short_description"].as_str().unwrap_or(""),
-                "pull_count": r["pull_count"].as_i64().unwrap_or(0),
-                "star_count": r["star_count"].as_i64().unwrap_or(0),
-                "is_official": r["is_official"].as_bool().unwrap_or(false),
-            }))
-        })
-        .collect();
-
+    let body = resp.into_string().map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("Invalid response: {}", e))?;
+    let results_list = parsed["results"].as_array().cloned().unwrap_or_default();
+    let results: Vec<serde_json::Value> = results_list.iter().filter_map(|r| {
+        let name = r["repo_name"].as_str()?;
+        Some(json!({
+            "name": name,
+            "description": r["short_description"].as_str().unwrap_or(""),
+            "pull_count": r["pull_count"].as_i64().unwrap_or(0),
+            "star_count": r["star_count"].as_i64().unwrap_or(0),
+            "is_official": r["is_official"].as_bool().unwrap_or(false),
+        }))
+    }).collect();
     Ok(results)
 }
 
@@ -691,13 +740,9 @@ fn urlencoding(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(byte as char);
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => result.push(byte as char),
             b' ' => result.push_str("%20"),
-            _ => {
-                result.push_str(&format!("%{:02X}", byte));
-            }
+            _ => { result.push_str(&format!("%{:02X}", byte)); }
         }
     }
     result
@@ -705,17 +750,10 @@ fn urlencoding(s: &str) -> String {
 
 fn fetch_tags(repo: &str, page: u32) -> Result<serde_json::Value> {
     let tags_url = if repo.contains('/') {
-        format!(
-            "https://hub.docker.com/v2/repositories/{}/tags/?page={}&page_size=20",
-            repo, page
-        )
+        format!("https://hub.docker.com/v2/repositories/{}/tags/?page={}&page_size=20", repo, page)
     } else {
-        format!(
-            "https://hub.docker.com/v2/repositories/library/{}/tags/?page={}&page_size=20",
-            repo, page
-        )
+        format!("https://hub.docker.com/v2/repositories/library/{}/tags/?page={}&page_size=20", repo, page)
     };
-
     let resp: ureq::Response = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(5))
         .timeout_read(std::time::Duration::from_secs(5))
@@ -725,25 +763,10 @@ fn fetch_tags(repo: &str, page: u32) -> Result<serde_json::Value> {
         .set("Accept", "application/json")
         .call()
         .map_err(|e| anyhow::anyhow!("Docker Hub request failed: {}", e))?;
-
-    let body = resp
-        .into_string()
-        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("Invalid response: {}", e))?;
-
-    let tags: Vec<String> = parsed["results"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
-        .collect();
-
+    let body = resp.into_string().map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("Invalid response: {}", e))?;
+    let tags: Vec<String> = parsed["results"].as_array().unwrap_or(&vec![]).iter()
+        .filter_map(|t| t["name"].as_str().map(|s| s.to_string())).collect();
     let has_next = parsed["next"].is_string();
-
-    Ok(json!({
-        "tags": tags,
-        "has_next": has_next,
-    }))
+    Ok(json!({ "tags": tags, "has_next": has_next }))
 }

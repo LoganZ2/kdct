@@ -1,610 +1,539 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  let overview: any = null;
+  let images: any[] = [];
+  let nodes: any[] = [];
+  let bridges: any[] = [];
+  let bridgeDetail: any = null;
+  let expandedBridge: number | null = null;
 
-  interface ImageNode { id: number; name: string; source: string; source_type: string; status: string; created_at: number; }
-  interface ImageDetail extends ImageNode {
-    ports: { id: number; port: number; protocol: string; route_path: string | null }[];
-    envs: { key: string; value: string }[];
-    deployable: boolean;
-    deploy_error: string | null;
-  }
-  interface NodeItem { id: number; hostname: string; os: string; arch: string; docker_version: string; port_range_start: number; port_range_end: number; cpu_cores: number; memory_mb: number; status: string; last_seen: number; }
-  interface Container { container_name: string; image: string; hostname: string; ports: number[]; status: string; }
-  interface Overview { node_count: number; online_count: number; image_count: number; configured_count: number; container_count: number; }
-
-  let overview = $state<Overview | null>(null);
-  let images = $state<ImageNode[]>([]);
-  let nodes = $state<NodeItem[]>([]);
-  let containers = $state<Container[]>([]);
-  let err = $state('');
-
-  // Expand image detail
-  let expanded = $state<string | null>(null);
-  let detail = $state<ImageDetail | null>(null);
-  let detailLoading = $state(false);
-
-  // Config: route editing
-  let routeImg = $state('');
-  let routePort = $state(0);
-  let routePath = $state('');
-  let routeMsg = $state('');
-  let routing = $state(false);
-
-  // Config: env editing
-  let envImg = $state('');
-  let envKey = $state('');
-  let envVal = $state('');
-  let envMsg = $state('');
-  let enving = $state(false);
-
-  // Deploy
-  let deployImg = $state<string | null>(null);
-  let deployNid = $state(0);
-  let deploying = $state(false);
-  let deployMsg = $state('');
+  // Modals
+  let showLoad = false;
+  let showDeploy = false;
+  let deployBridgeId = 0;
+  let deployNodeId = 0;
+  let deployBridgeName = '';
 
   // Load image
-  let showLoad = $state(false);
-  let loading = $state(false);
-  let loadJobId = $state('');
-  let loadLogs = $state<string[]>([]);
-  let loadResult = $state<'ok'|'err'|''>('');
-  let loadMsg = $state('');
-  let searchQuery = $state('');
-  let searchResults = $state<any[]>([]);
-  let searching = $state(false);
-  let searchTimer = 0;
-  let selectedRepo = $state('');
-  let selectedTag = $state('');
-  let tags = $state<string[]>([]);
-  let tagPage = $state(1);
-  let hasMoreTags = $state(false);
-  let loadingTags = $state(false);
-  let tagFilter = $state('');
-  let customName = $state('');
+  let searchQuery = '';
+  let searchResults: any[] = [];
+  let searching = false;
+  let pickedRepo = '';
+  let loading = false;
+  let loadStatus = '';
+  let loadLogs: string[] = [];
+  let loadJobId = '';
+  let loadName = '';
+  let showTags = false;
+  let tags: string[] = [];
+  let tagPage = 1;
+  let tagHasNext = false;
+  let tagFilter = '';
+  let pickedTag = '';
+  let showManual = false;
 
-  // Manual load
-  let showManualModal = $state(false);
-  let manualSource = $state('');
-  let manualName = $state('');
-  let manualLoading = $state(false);
-  let manualResult = $state<'ok'|'err'|''>('');
-  let manualMsg = $state('');
+  // Bridge edit
+  let addingPort = false;
+  let portContainerPort = 0;
+  let portMode = 'route';
+  let portRoutePath = '';
+  let portProtocols: string[] = ['tcp'];
+  let addingEnv = false;
+  let envKey = '';
+  let envVal = '';
+  let portMsg = '';
+  let envMsg = '';
 
-  const filteredTags = $derived(tagFilter.trim()
-    ? tags.filter(t => t.toLowerCase().includes(tagFilter.trim().toLowerCase()))
-    : tags
-  );
-  const online = $derived(nodes.filter(n => n.status === 'online'));
+  // New bridge
+  let showNewBridge = false;
+  let newBridgeName = '';
+  let newBridgeImage = '';
+
+  // Timer
+  import { onMount, onDestroy } from 'svelte';
+  let timer: any = null;
 
   async function refresh() {
     try {
-      const [o, im, nd] = await Promise.all([
+      const [ov, im, nd, br] = await Promise.all([
         fetch('/api/overview').then(r => r.json()),
         fetch('/api/images').then(r => r.json()),
-        fetch('/api/nodes').then(r => r.json())
+        fetch('/api/nodes').then(r => r.json()),
+        fetch('/api/bridges').then(r => r.json()),
       ]);
-      overview = o; images = im; nodes = nd; err = '';
-      try { containers = await fetch('/api/deployments').then(r => r.json()); } catch { containers = []; }
-    } catch { err = 'Cannot reach kdcts server'; }
-  }
-
-  onMount(() => {
-    refresh();
-    const iv = setInterval(refresh, 4000);
-    return () => clearInterval(iv);
-  });
-
-  function mem(mb: number) { return mb >= 1024 ? `${(mb/1024).toFixed(1)} GB` : `${mb} MB`; }
-  function dk(v: string) { return v ? v.split('.').slice(0,2).join('.') : '—'; }
-  function ago(ts: number) {
-    const s = Math.floor(Date.now()/1000 - ts);
-    if (s < 60) return 'just now';
-    if (s < 3600) return `${Math.floor(s/60)}m ago`;
-    if (s < 86400) return `${Math.floor(s/3600)}h ago`;
-    return `${Math.floor(s/86400)}d ago`;
-  }
-  function deps(name: string) { return containers.filter(c => c.image === name || c.image.startsWith(name + ':')); }
-  function nid(h: string) { return nodes.find(n => n.hostname === h)?.id || 0; }
-
-  // Image detail
-  async function toggleDetail(name: string) {
-    if (expanded === name) { expanded = null; detail = null; return; }
-    expanded = name; detail = null; detailLoading = true;
-    try { detail = await fetch(`/api/images/${encodeURIComponent(name)}`).then(r => r.json()); }
-    catch { detail = null; }
-    detailLoading = false;
-  }
-
-  async function refreshDetail() {
-    if (!expanded) return;
-    try { detail = await fetch(`/api/images/${encodeURIComponent(expanded)}`).then(r => r.json()); }
-    catch { detail = null; }
-  }
-
-  // Route config
-  function openRoute(img: string, port: number) {
-    routeImg = img; routePort = port; routePath = ''; routeMsg = '';
-  }
-  async function doRoute() {
-    if (!routePath.startsWith('/')) { routeMsg = 'Path must start with /'; return; }
-    routing = true; routeMsg = '';
-    try {
-      const res = await fetch('/api/image/route', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: routeImg, port: routePort, path: routePath })
-      });
-      const t = await res.text();
-      routeMsg = res.ok ? t : `Error: ${t}`;
-      if (res.ok) { routePath = ''; refreshDetail(); }
-    } catch (e: any) { routeMsg = e.message || 'Failed'; }
-    routing = false;
-  }
-
-  // Env config
-  function openEnv(img: string) { envImg = img; envKey = ''; envVal = ''; envMsg = ''; }
-  async function doEnv() {
-    if (!envKey.trim() || !envVal.trim()) { envMsg = 'Key and value required'; return; }
-    enving = true; envMsg = '';
-    try {
-      const cur = detail?.envs || [];
-      const pairs = [...cur, { key: envKey.trim(), value: envVal.trim() }];
-      const res = await fetch('/api/image/env', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: envImg, envs: pairs })
-      });
-      const t = await res.text();
-      envMsg = res.ok ? t : `Error: ${t}`;
-      if (res.ok) { envKey = ''; envVal = ''; refreshDetail(); }
-    } catch (e: any) { envMsg = e.message || 'Failed'; }
-    enving = false;
-  }
-
-  async function deleteEnv(img: string, key: string) {
-    const cur = detail?.envs || [];
-    const pairs = cur.filter(e => e.key !== key).map(e => ({ key: e.key, value: e.value }));
-    enving = true;
-    try {
-      const res = await fetch('/api/image/env', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: img, envs: pairs })
-      });
-      if (res.ok) refreshDetail();
-    } catch {}
-    enving = false;
-  }
-
-  // Deploy
-  function openDeploy(img: string) {
-    deployImg = img; deployNid = online[0]?.id || 0; deployMsg = '';
-  }
-  async function doDeploy() {
-    if (!deployImg || !deployNid) return;
-    deploying = true; deployMsg = '';
-    try {
-      const res = await fetch('/api/deploy', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: deployImg, node_id: deployNid })
-      });
-      const t = await res.text();
-      if (res.ok) { deployMsg = t; deployImg = null; refresh(); }
-      else deployMsg = `Error: ${t}`;
-    } catch (e: any) { deployMsg = e.message || 'Deploy failed'; }
-    deploying = false;
-  }
-
-  async function doStop(name: string, hostname: string) {
-    const id = nid(hostname); if (!id) return;
-    try {
-      await fetch('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: name, node_id: id }) });
-      refresh();
+      overview = ov; images = im; nodes = nd; bridges = br;
+      if (expandedBridge) { refreshBridgeDetail(expandedBridge); }
     } catch {}
   }
 
-  // Load image
-  function openLoad() { showLoad = true; loadResult = ''; loadMsg = ''; loadLogs = []; loadJobId = ''; searchQuery = ''; searchResults = []; selectedRepo = ''; selectedTag = ''; tags = []; tagPage = 1; hasMoreTags = false; tagFilter = ''; customName = ''; }
-  function closeLoad() { if (!loading) { showLoad = false; loadJobId = ''; } }
-  function handleSearchInput() {
-    clearTimeout(searchTimer);
-    if (searchQuery.length < 2) { searchResults = []; return; }
+  async function refreshBridgeDetail(id: number) {
+    try {
+      bridgeDetail = await fetch(`/api/bridges/${id}`).then(r => r.json());
+    } catch { bridgeDetail = null; }
+  }
+
+  function toggleBridge(id: number) {
+    if (expandedBridge === id) { expandedBridge = null; bridgeDetail = null; return; }
+    expandedBridge = id; bridgeDetail = null; refreshBridgeDetail(id);
+  }
+
+  onMount(() => { refresh(); timer = setInterval(refresh, 5000); });
+  onDestroy(() => { if (timer) clearInterval(timer); });
+
+  // Search Docker Hub
+  async function doSearch(q: string) {
+    if (q.length < 2) { searchResults = []; return; }
     searching = true;
-    searchTimer = setTimeout(async () => {
-      try { searchResults = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`).then(r => r.json()); } catch { searchResults = []; }
-      searching = false;
-    }, 250);
-  }
-  async function pickImage(repo: string) {
-    selectedRepo = repo; selectedTag = ''; customName = repo; searchQuery = ''; searchResults = []; tags = []; tagPage = 1; hasMoreTags = false; tagFilter = ''; loadingTags = true;
     try {
-      const res = await fetch(`/api/tags?repo=${encodeURIComponent(repo)}&page=1`);
-      const data = await res.json();
-      tags = data.tags || []; hasMoreTags = data.has_next;
-    } catch { tags = []; }
-    loadingTags = false;
-  }
-  async function loadMoreTags() {
-    if (!hasMoreTags || loadingTags) return;
-    loadingTags = true; const nextPage = tagPage + 1;
-    try {
-      const res = await fetch(`/api/tags?repo=${encodeURIComponent(selectedRepo)}&page=${nextPage}`);
-      const data = await res.json();
-      tags = [...tags, ...(data.tags || [])]; hasMoreTags = data.has_next; tagPage = nextPage;
-    } catch {}
-    loadingTags = false;
-  }
-  function onTagScroll(e: Event) {
-    const el = e.target as HTMLElement;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 10) loadMoreTags();
-  }
-  async function doLoad() {
-    if (!selectedRepo) return;
-    const source = selectedTag ? `${selectedRepo}:${selectedTag}` : selectedRepo;
-    const name = customName.trim(); if (!name) return;
-    loading = true; loadResult = ''; loadMsg = ''; loadLogs = []; loadJobId = '';
-    try {
-      const res = await fetch('/api/image/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, name }) });
-      const data = await res.json();
-      if (data.job_id) { loadJobId = data.job_id; pollLoadProgress(); }
-      else { loadResult = 'err'; loadMsg = 'Failed to start job'; loading = false; }
-    } catch (e: any) { loadResult = 'err'; loadMsg = e.message || 'Load failed'; loading = false; }
-  }
-  async function pollLoadProgress() {
-    if (!loadJobId) return;
-    try {
-      const res = await fetch(`/api/image/load/progress?job=${loadJobId}`);
-      const data = await res.json(); loadLogs = [...(data.logs || [])];
-      if (data.status === 'done') { loadResult = 'ok'; loadMsg = data.result; loading = false; refresh(); }
-      else if (data.status === 'error') { loadResult = 'err'; loadMsg = data.result || 'Unknown error'; loading = false; }
-      else setTimeout(pollLoadProgress, 500);
-    } catch (e: any) { loadResult = 'err'; loadMsg = e.message; loading = false; }
+      searchResults = await fetch(`/api/search?q=${encodeURIComponent(q)}`).then(r => r.json());
+    } catch { searchResults = []; }
+    searching = false;
   }
 
-  function openManual() { showManualModal = true; manualSource = ''; manualName = ''; manualResult = ''; manualMsg = ''; loadLogs = []; loadJobId = ''; }
-  async function doManualLoad() {
-    const source = manualSource.trim(); if (!source) return;
-    const name = manualName.trim() || source.replace(/[:/@]/g, '-');
-    manualLoading = true; manualResult = ''; manualMsg = '';
-    try {
-      const res = await fetch('/api/image/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, name }) });
-      const data = await res.json();
-      if (data.job_id) { loadJobId = data.job_id; pollManualProgress(); }
-      else { manualResult = 'err'; manualMsg = 'Failed to start job'; manualLoading = false; }
-    } catch (e: any) { manualResult = 'err'; manualMsg = e.message || 'Load failed'; manualLoading = false; }
+  function pickRepo(repo: string) {
+    pickedRepo = repo; pickedTag = ''; tags = []; tagPage = 1; showTags = true;
+    fetchTags(repo, 1);
   }
-  async function pollManualProgress() {
-    if (!loadJobId) return;
+
+  async function fetchTags(repo: string, page: number) {
     try {
-      const res = await fetch(`/api/image/load/progress?job=${loadJobId}`);
-      const data = await res.json(); loadLogs = [...(data.logs || [])];
-      if (data.status === 'done') { manualResult = 'ok'; manualMsg = data.result; manualLoading = false; refresh(); }
-      else if (data.status === 'error') { manualResult = 'err'; manualMsg = data.result || 'Unknown error'; manualLoading = false; }
-      else setTimeout(pollManualProgress, 500);
-    } catch (e: any) { manualResult = 'err'; manualMsg = e.message; manualLoading = false; }
+      const res = await fetch(`/api/tags?repo=${encodeURIComponent(repo)}&page=${page}`).then(r => r.json());
+      if (page === 1) { tags = res.tags || []; }
+      else { tags = [...tags, ...(res.tags || [])]; }
+      tagHasNext = res.has_next;
+      tagPage = page;
+    } catch {}
   }
+
+  function loadMoreTags() {
+    if (tagHasNext) fetchTags(pickedRepo, tagPage + 1);
+  }
+
+  function filteredTags() {
+    if (!tagFilter) return tags;
+    return tags.filter(t => t.toLowerCase().includes(tagFilter.toLowerCase()));
+  }
+
+  async function doLoad() {
+    if (!pickedRepo) return;
+    loading = true; loadStatus = 'connecting'; loadLogs = [];
+    try {
+      const body: any = { source: pickedRepo };
+      if (pickedTag) body.source = `${pickedRepo}:${pickedTag}`;
+      if (loadName) body.name = loadName;
+      const res = await fetch('/api/image/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const { job_id } = await res.json();
+      loadJobId = job_id;
+      pollLoad();
+    } catch (e: any) { loadLogs = [e.message || 'Failed']; loading = false; }
+  }
+
+  function pollLoad() {
+    const iv = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/image/load/progress?job=${loadJobId}`).then(r => r.json());
+        loadLogs = res.logs || [];
+        loadStatus = res.status;
+        if (res.status === 'done' || res.status === 'error') {
+          loading = false;
+          clearInterval(iv);
+          refresh();
+        }
+      } catch {}
+    }, 500);
+  }
+
+  function closeLoad() { showLoad = false; loading = false; loadLogs = []; loadStatus = ''; loadJobId = ''; pickedRepo = ''; pickedTag = ''; tags = []; showTags = false; loadName = ''; }
+
+  // Bridge CRUD
+  async function createBridge() {
+    if (!newBridgeName || !newBridgeImage) return;
+    try {
+      await fetch('/api/bridges', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newBridgeName, image: newBridgeImage }),
+      });
+      showNewBridge = false; newBridgeName = ''; newBridgeImage = '';
+      refresh();
+    } catch (e: any) { }
+  }
+
+  async function deleteBridge(id: number) {
+    if (!confirm('Delete this bridge?')) return;
+    await fetch(`/api/bridges/${id}`, { method: 'DELETE' });
+    if (expandedBridge === id) { expandedBridge = null; bridgeDetail = null; }
+    refresh();
+  }
+
+  async function addPort(bridgeId: number) {
+    if (!portContainerPort) return;
+    if (portMode === 'route' && !portRoutePath.startsWith('/')) { portMsg = 'Path must start with /'; return; }
+    portMsg = '';
+    try {
+      const body: any = { container_port: portContainerPort, mode: portMode };
+      if (portMode === 'route') body.route_path = portRoutePath;
+      if (portMode === 'direct') body.protocols = portProtocols;
+      const res = await fetch(`/api/bridges/${bridgeId}/port`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (res.ok) { portContainerPort = 0; portRoutePath = ''; addingPort = false; portProtocols = ['tcp']; refreshBridgeDetail(bridgeId); }
+      else { portMsg = await res.text(); }
+    } catch (e: any) { portMsg = e.message; }
+  }
+
+  async function deletePort(bridgeId: number, containerPort: number) {
+    await fetch(`/api/bridges/${bridgeId}/port/${containerPort}`, { method: 'DELETE' });
+    refreshBridgeDetail(bridgeId);
+  }
+
+  async function addEnv(bridgeId: number) {
+    if (!envKey) return;
+    const cur = bridgeDetail?.envs || [];
+    const pairs = [...cur, { key: envKey, value: envVal }];
+    envMsg = '';
+    try {
+      const res = await fetch(`/api/bridges/${bridgeId}/env`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ envs: pairs }),
+      });
+      if (res.ok) { envKey = ''; envVal = ''; addingEnv = false; refreshBridgeDetail(bridgeId); }
+      else { envMsg = await res.text(); }
+    } catch (e: any) { envMsg = e.message; }
+  }
+
+  async function deleteEnv(bridgeId: number, key: string) {
+    const cur = bridgeDetail?.envs || [];
+    const pairs = cur.filter((e: any) => e.key !== key);
+    try {
+      await fetch(`/api/bridges/${bridgeId}/env`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ envs: pairs }),
+      });
+      refreshBridgeDetail(bridgeId);
+    } catch {}
+  }
+
+  function openDeploy(id: number, name: string) {
+    deployBridgeId = id; deployBridgeName = name; deployNodeId = 0; showDeploy = true;
+  }
+
+  async function doDeploy() {
+    if (!deployBridgeId || !deployNodeId) return;
+    try {
+      await fetch(`/api/bridges/${deployBridgeId}/deploy`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: deployNodeId }),
+      });
+      showDeploy = false;
+      refresh();
+    } catch (e: any) { }
+  }
+
+  async function doStop(bridgeId: number) {
+    try {
+      await fetch(`/api/bridges/${bridgeId}/stop`, { method: 'POST' });
+      refresh();
+    } catch (e: any) { }
+  }
+
+  $: onlineNodes = nodes.filter((n: any) => n.status === 'online');
+  $: filteredImages = images;
 </script>
 
-{#if err}
-  <div class="msg err">{err}</div>
-{/if}
-
-{#if overview}
+<div class="page">
+  <!-- Stats -->
+  {#if overview}
   <div class="stats">
-    <div class="stat">
-      <div class="stat-v">{overview.online_count}<span style="color:var(--text-dim);font-weight:400">/{overview.node_count}</span></div>
-      <div class="stat-l">Nodes online</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.configured_count}<span style="color:var(--text-dim);font-weight:400">/{overview.image_count}</span></div>
-      <div class="stat-l">Images configured</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.container_count}</div>
-      <div class="stat-l">Containers running</div>
-    </div>
+    <div class="stat"><span class="stat-val">{overview.online_count}</span> <span class="dim">nodes online</span></div>
+    <div class="stat"><span class="stat-val">{overview.image_count}</span> <span class="dim">images</span></div>
+    <div class="stat"><span class="stat-val">{overview.bridge_count ?? 0}</span> <span class="dim">bridges</span></div>
+    <div class="stat"><span class="stat-val">{overview.deployed_count ?? 0}</span> <span class="dim">deployed</span></div>
+    <div class="stat"><span class="stat-val">{overview.container_count}</span> <span class="dim">containers</span></div>
+    <div class="stat"><span class="stat-val">{overview.pool_free ?? '-'}/{overview.pool_total ?? '-'}</span> <span class="dim">free/total ports</span></div>
   </div>
-{/if}
+  {/if}
 
-<!-- IMAGES -->
-<div class="section">
-  <div class="section-head">
-    <div style="display:flex;align-items:center;gap:12px">
-      <h2>Images</h2>
-      <span>{images.length} total</span>
-    </div>
-    <button class="primary" style="font-size:11px;padding:4px 10px" onclick={openLoad}>+ Load Image</button>
-  </div>
-
-  {#if images.length === 0}
-    <div class="empty">No images loaded. Click <em>+ Load Image</em> to load a Docker image or Git repository.</div>
-  {:else}
+  <!-- Images -->
+  <div class="section">
+    <div class="section-head"><h2>Images</h2><button class="ghost small" on:click={() => showLoad = true}>+ Load Image</button></div>
     <table>
-      <thead><tr><th>Name</th><th>Source</th><th>Type</th><th>Status</th><th>Running on</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Source</th><th>Type</th><th>Status</th><th class="actions">Actions</th></tr></thead>
       <tbody>
-        {#each images as img}
-          {@const dd = deps(img.name)}
-          <tr class="row-link" class:expanded={expanded === img.name}>
-            <td class="hi" style="font-weight:500;cursor:pointer" onclick={() => toggleDetail(img.name)} onkeydown={(e) => { if (e.key === 'Enter') toggleDetail(img.name); }} role="button" tabindex="0">{img.name}</td>
-            <td class="dim truncate" style="max-width:200px">{img.source}</td>
+        {#each filteredImages as img}
+          <tr>
+            <td class="hi">{img.name}</td>
+            <td class="dim">{img.source}</td>
             <td class="dim">{img.source_type}</td>
             <td><span class="badge {img.status}">{img.status}</span></td>
-            <td>
-              {#if dd.length > 0}
-                {#each dd as c}
-                  <div style="display:flex;align-items:center;gap:5px;padding:1px 0">
-                    <span class="dot online" style="width:5px;height:5px"></span>
-                    <span class="dim" style="font-size:11px">{c.hostname}</span>
-                    <span class="dim" style="font-size:11px">&middot; :{c.ports?.join(',') || '—'}</span>
-                  </div>
-                {/each}
-              {:else}
-                <span class="dim">—</span>
-              {/if}
-            </td>
-            <td>
-              <div style="display:flex;gap:6px">
-                {#each dd as c}
-                  <button class="danger" onclick={() => doStop(img.name, c.hostname)}>Stop</button>
-                {/each}
-              </div>
+            <td class="actions">
+              <button class="ghost small" on:click={() => { newBridgeImage = img.name; newBridgeName = img.name.replace(/[/:]/g, '-'); showNewBridge = true; }}>Create Bridge</button>
             </td>
           </tr>
+        {:else}
+          <tr><td colspan="5" class="dim" style="text-align:center;padding:32px">No images loaded. Use <b>Load Image</b> to pull from Docker Hub.</td></tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 
-          {#if expanded === img.name}
-            <tr>
-              <td colspan="6" style="padding:0;border-bottom:1px solid var(--border2)">
-                <div class="expand-pad">
-                  {#if detailLoading}
-                    <div class="dim" style="font-size:12px;padding:16px 0">Loading...</div>
-                  {:else if detail}
-                    <!-- Ports -->
-                    <div class="section-head" style="margin-bottom:8px"><h2>Ports & Routes</h2></div>
-                    {#if detail.ports?.length}
-                      <table style="margin-bottom:16px">
-                        <thead><tr><th>Port</th><th>Proto</th><th>Route Path</th><th></th></tr></thead>
-                        <tbody>
-                          {#each detail.ports as p}
-                            <tr>
-                              <td class="hi">{p.port}</td>
-                              <td class="dim">{p.protocol}</td>
-                              <td class="dim">
-                                {#if p.route_path}
-                                  {p.route_path}
-                                {:else}
-                                  <span style="color:var(--amber)">(not set)</span>
-                                {/if}
-                              </td>
-                              <td>
-                                <button class="ghost" style="font-size:10px;padding:2px 8px" onclick={() => openRoute(img.name, p.port)}>{p.route_path ? 'Edit' : 'Set Route'}</button>
-                              </td>
-                            </tr>
-                          {/each}
-                        </tbody>
-                      </table>
-
-                      {#if routeImg === img.name && routePort > 0}
-                        <div class="config-row">
-                          <span class="dim" style="font-size:11px">Port :{routePort}</span>
-                          <input style="width:auto;flex:1" bind:value={routePath} placeholder="/api/my-app" disabled={routing} onkeydown={(e) => { if (e.key === 'Enter') doRoute(); }} />
-                          <button onclick={doRoute} disabled={routing}>{routing ? '...' : 'Save'}</button>
-                        </div>
-                        {#if routeMsg}
-                          <div class="dim" style="font-size:10px;margin-top:4px;color:{routeMsg.startsWith('Error') ? 'var(--red)' : 'var(--green)'}">{routeMsg}</div>
-                        {/if}
-                      {/if}
+  <!-- Bridges -->
+  <div class="section">
+    <div class="section-head"><h2>Bridges</h2></div>
+    {#if bridges.length === 0}
+      <div class="dim" style="text-align:center;padding:32px">No bridges yet. Load an image, then create a bridge to configure ports and deploy.</div>
+    {:else}
+    <table>
+      <thead><tr><th>Name</th><th>Image</th><th>Status</th><th>Node</th><th class="actions">Actions</th></tr></thead>
+      <tbody>
+        {#each bridges as br}
+          {@const deployed = br.status === 'deployed'}
+          <tr>
+            <td class="hi"><button class="ghost small mono" on:click={() => toggleBridge(br.id)}>{br.name}</button></td>
+            <td class="dim">{br.image_name}</td>
+            <td><span class="badge {br.status}">{br.status}</span></td>
+            <td class="dim">{br.node_id ?? '-'}</td>
+            <td class="actions">
+              {#if deployed}
+                <button class="ghost small danger" on:click={() => doStop(br.id)}>Stop</button>
+              {:else}
+                <button class="ghost small" on:click={() => openDeploy(br.id, br.name)}>Deploy</button>
+              {/if}
+              <button class="ghost small danger" on:click={() => deleteBridge(br.id)} style="margin-left:4px">×</button>
+            </td>
+          </tr>
+          {#if expandedBridge === br.id && bridgeDetail}
+            <tr><td colspan="5">
+              <div class="detail-panel">
+                <!-- Ports -->
+                <div class="section-head" style="margin-bottom:8px"><h3>Ports</h3></div>
+                {#if bridgeDetail.ports?.length}
+                  <table style="margin-bottom:8px">
+                    <thead><tr><th>Container Port</th><th>Mode</th><th>Route Path</th><th>Protocols</th><th></th></tr></thead>
+                    <tbody>
+                      {#each bridgeDetail.ports as p}
+                        <tr>
+                          <td class="hi">{p.container_port}</td>
+                          <td>{#if p.mode === 'direct'}<span class="badge direct">direct</span>{:else}<span class="badge route">route</span>{/if}</td>
+                          <td class="dim">{p.mode === 'route' ? (p.route_path || '-') : '-'}</td>
+                          <td class="dim">{p.mode === 'direct' ? (p.protocols || 'tcp') : 'http'}</td>
+                          <td><button class="ghost small danger" on:click={() => deletePort(br.id, p.container_port)}>×</button></td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {/if}
+                {#if addingPort && br.id === expandedBridge}
+                  <div class="config-row" style="margin-bottom:8px;flex-wrap:wrap">
+                    <input type="number" bind:value={portContainerPort} placeholder="Container port" style="width:60px" />
+                    <select bind:value={portMode} style="font-family:var(--mono);font-size:11px;background:var(--bg);border:1px solid var(--border2);color:var(--text-hi);padding:4px">
+                      <option value="route">route</option>
+                      <option value="direct">direct</option>
+                    </select>
+                    {#if portMode === 'route'}
+                      <input bind:value={portRoutePath} placeholder="/api/..." style="flex:1" />
                     {:else}
-                      <div class="dim mono" style="font-size:12px;padding:8px 0">No ports configured</div>
+                      <label style="font-size:10px;display:flex;align-items:center;gap:2px"><input type="checkbox" bind:group={portProtocols} value="tcp" />TCP</label>
+                      <label style="font-size:10px;display:flex;align-items:center;gap:2px"><input type="checkbox" bind:group={portProtocols} value="udp" />UDP</label>
                     {/if}
+                    <button class="ghost small" on:click={() => addPort(br.id)}>Add</button>
+                    <button class="ghost small" on:click={() => addingPort = false}>Cancel</button>
+                  </div>
+                  {#if portMsg}<div class="dim" style="font-size:10px;color:var(--red)">{portMsg}</div>{/if}
+                {:else}
+                  <button class="ghost small" on:click={() => { addingPort = true; portContainerPort = 0; portMode = 'route'; portRoutePath = ''; portProtocols = ['tcp']; portMsg = ''; }} style="margin-bottom:8px">+ Add Port</button>
+                {/if}
 
-                    <!-- Envs -->
-                    <div class="section-head" style="margin-bottom:8px;margin-top:16px"><h2>Environment</h2></div>
-                    {#if detail.envs?.length}
-                      <table style="margin-bottom:16px">
-                        <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
-                        <tbody>
-                          {#each detail.envs as e}
-                            <tr>
-                              <td class="hi">{e.key}</td>
-                              <td class="dim">{e.value}</td>
-                              <td><button class="ghost danger" style="font-size:10px;padding:2px 6px" onclick={() => deleteEnv(img.name, e.key)}>×</button></td>
-                            </tr>
-                          {/each}
-                        </tbody>
-                      </table>
-                    {/if}
+                <!-- Envs -->
+                <div class="section-head" style="margin-bottom:8px;margin-top:16px"><h3>Environment</h3></div>
+                {#if bridgeDetail.envs?.length}
+                  <table style="margin-bottom:8px">
+                    <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
+                    <tbody>
+                      {#each bridgeDetail.envs as e}
+                        <tr>
+                          <td class="hi">{e.key}</td>
+                          <td class="dim">{e.value}</td>
+                          <td><button class="ghost small danger" on:click={() => deleteEnv(br.id, e.key)}>×</button></td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {/if}
+                {#if addingEnv && br.id === expandedBridge}
+                  <div class="config-row" style="margin-bottom:8px">
+                    <input bind:value={envKey} placeholder="KEY" style="flex:1" />
+                    <input bind:value={envVal} placeholder="VALUE" style="flex:2" />
+                    <button class="ghost small" on:click={() => addEnv(br.id)}>Add</button>
+                    <button class="ghost small" on:click={() => addingEnv = false}>Cancel</button>
+                  </div>
+                  {#if envMsg}<div class="dim" style="font-size:10px;color:var(--red)">{envMsg}</div>{/if}
+                {:else}
+                  <button class="ghost small" on:click={() => { addingEnv = true; envKey = ''; envVal = ''; envMsg = ''; }}>+ Add Env</button>
+                {/if}
 
-                    <div style="margin-bottom:12px">
-                      <button class="ghost" style="font-size:10px" onclick={() => openEnv(img.name)}>+ Add Env</button>
-                    </div>
-
-                    {#if envImg === img.name}
-                      <div class="config-row">
-                        <input style="width:auto;flex:1" bind:value={envKey} placeholder="KEY" disabled={enving} />
-                        <input style="width:auto;flex:2" bind:value={envVal} placeholder="VALUE" disabled={enving} />
-                        <button onclick={doEnv} disabled={enving}>{enving ? '...' : 'Add'}</button>
-                      </div>
-                      {#if envMsg}
-                        <div class="dim" style="font-size:10px;margin-top:4px;color:{envMsg.startsWith('Error') ? 'var(--red)' : 'var(--green)'}">{envMsg}</div>
-                      {/if}
-                    {/if}
-
-                    <!-- Deploy -->
-                    <div class="section-head" style="margin-bottom:8px;margin-top:16px"><h2>Deploy</h2></div>
-                    {#if detail.deployable}
-                      {#if online.length > 0}
-                        <button class="primary" onclick={() => openDeploy(img.name)}>Deploy</button>
-                      {:else}
-                        <span class="dim" style="font-size:11px">No online nodes available</span>
-                      {/if}
-                    {:else}
-                      <div class="dim mono" style="font-size:11px;color:var(--amber)">{detail.deploy_error || 'Not deployable'}</div>
-                    {/if}
+                <!-- Deploy info -->
+                {#if bridgeDetail.deployable}
+                  <div class="section-head" style="margin-bottom:8px;margin-top:16px"><h3>Deploy</h3></div>
+                  {#if onlineNodes.length > 0}
+                    <button class="primary small" on:click={() => openDeploy(br.id, br.name)}>Deploy</button>
+                  {:else}
+                    <span class="dim" style="font-size:11px">No online nodes</span>
                   {/if}
-                </div>
-              </td>
-            </tr>
+                {:else if bridgeDetail.ports?.length > 0}
+                  <div class="dim" style="margin-top:8px;color:var(--amber);font-size:11px">{bridgeDetail.deploy_error || 'Not deployable'}</div>
+                {/if}
+              </div>
+            </td></tr>
           {/if}
         {/each}
       </tbody>
     </table>
-  {/if}
-</div>
-
-<!-- NODES -->
-<div class="section">
-  <div class="section-head">
-    <h2>Nodes</h2>
-    <span>{nodes.length} total / {online.length} online</span>
+    {/if}
   </div>
 
-  {#if nodes.length === 0}
-    <div class="empty">No nodes registered. Launch a KDCT client on your target machines.</div>
-  {:else}
+  <!-- Nodes -->
+  <div class="section">
+    <div class="section-head"><h2>Nodes</h2><span class="dim">{onlineNodes.length} online</span></div>
     <table>
-      <thead><tr><th></th><th>Hostname</th><th>OS</th><th>Arch</th><th>Docker</th><th>CPU</th><th>Memory</th><th>Port Range</th><th>Last Seen</th><th>Status</th></tr></thead>
+      <thead><tr><th>Hostname</th><th>OS</th><th>Docker</th><th>CPU</th><th>Memory</th><th>Port Range</th><th>Status</th></tr></thead>
       <tbody>
         {#each nodes as n}
           <tr>
-            <td><span class="dot {n.status}"></span></td>
             <td class="hi">{n.hostname}</td>
-            <td class="dim">{n.os || '—'}</td>
-            <td class="dim">{n.arch || '—'}</td>
-            <td class="dim">{dk(n.docker_version)}</td>
+            <td class="dim">{n.os} {n.arch}</td>
+            <td class="dim">{n.docker_version}</td>
             <td class="dim">{n.cpu_cores} cores</td>
-            <td class="dim">{mem(n.memory_mb)}</td>
-            <td class="dim">{n.port_range_start} &ndash; {n.port_range_end}</td>
-            <td class="dim">{ago(n.last_seen)}</td>
+            <td class="dim">{n.memory_mb} MB</td>
+            <td class="dim">{n.port_range_start}–{n.port_range_end}</td>
             <td><span class="badge {n.status}">{n.status}</span></td>
           </tr>
+        {:else}
+          <tr><td colspan="7" class="dim" style="text-align:center;padding:32px">No nodes connected. Start a kdct client node on another machine.</td></tr>
         {/each}
       </tbody>
     </table>
-  {/if}
+  </div>
 </div>
 
-<!-- DEPLOY MODAL -->
-{#if deployImg}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={() => deployImg = null} onkeydown={(e) => { if (e.key === 'Escape') deployImg = null; }}>
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-      <div class="modal-head">
-        <span>Deploy <em>{deployImg}</em></span>
-        <button class="ghost" onclick={() => deployImg = null}>Cancel</button>
-      </div>
-      {#if deploying}
-        <div class="dim" style="font-size:11px;padding:16px 0">Deploying...</div>
-      {:else if deployMsg}
-        <div class="msg {deployMsg.startsWith('Error') ? 'err' : 'ok'}">{deployMsg}</div>
-        <button class="ghost" style="margin-top:12px" onclick={() => { if (!deployMsg.startsWith('Error')) deployImg = null; else deployMsg = ''; }}>
-          {deployMsg.startsWith('Error') ? 'Try again' : 'Close'}
-        </button>
-      {:else}
-        <div class="field">
-          <label for="dn">Target node</label>
-          <select id="dn" bind:value={deployNid}>
-            {#each online as n}
-              <option value={n.id}>{n.hostname} (id {n.id})</option>
-            {/each}
-          </select>
-        </div>
-        <button class="primary" onclick={doDeploy} disabled={!deployNid}>Deploy</button>
-      {/if}
-    </div>
-  </div>
-{/if}
-
-<!-- LOAD IMAGE MODAL -->
+<!-- Load Image Modal -->
 {#if showLoad}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={closeLoad} onkeydown={(e) => { if (e.key === 'Escape') closeLoad(); }}>
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-      <div class="modal-head">
-        <span>Load <em>Image</em></span>
-        <button class="ghost" onclick={closeLoad} disabled={loading}>Close</button>
-      </div>
-      {#if loadResult === 'ok'}
-        <div class="msg ok">{loadMsg}</div>
-        <button class="ghost" style="margin-top:12px" onclick={() => showLoad = false}>Close</button>
-      {:else if loadResult === 'err'}
-        <div class="msg err">{loadMsg}</div>
-        <button class="ghost" style="margin-top:12px" onclick={() => { loadResult = ''; loadMsg = ''; }}>Try again</button>
-      {:else if loading}
-        <div class="field">
-          <label>Image</label>
-          <div class="picked-repo">{selectedRepo}{selectedTag ? `:${selectedTag}` : ''}</div>
-        </div>
-        <div class="log-console">
-          {#each loadLogs as line}<div class="log-line">{line}</div>{/each}
-        </div>
-        <div class="dim" style="font-size:10px;text-align:center;margin-bottom:8px">Do not close or refresh this page</div>
-      {:else if !selectedRepo}
-        <div class="section-head" style="margin-bottom:10px"><h2>Docker Hub</h2></div>
-        <div class="field"><input bind:value={searchQuery} oninput={handleSearchInput} placeholder="Search nginx, redis, postgres..." disabled={loading} /></div>
-        {#if searching}<div class="dim" style="font-size:11px;padding:4px 0 8px">Searching...</div>{/if}
-        {#if searchResults.length > 0}
-          <div class="search-list">
-            {#each searchResults as r}
-              <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-              <div class="search-item" onclick={() => pickImage(r.name)} onkeydown={(e) => { if (e.key === 'Enter') pickImage(r.name); }} role="button" tabindex="0">
-                <div><span class="hi">{r.name}</span>{#if r.is_official}<span class="badge online">OFFICIAL</span>{/if}</div>
-                <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{r.description || '—'}</div>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        <button class="ghost" style="width:100%;margin-top:12px" onclick={() => { showLoad = false; openManual(); }}>Manual entry</button>
-      {:else}
-        <div class="field"><label>Image</label><div class="picked-repo">{selectedRepo}</div></div>
-        <div class="field">
-          <label for="tag">Tag</label>
-          {#if loadingTags && tags.length === 0}
-            <div class="dim" style="font-size:11px">Loading tags...</div>
-          {:else}
-            <input style="margin-bottom:6px" bind:value={tagFilter} placeholder="Filter tags..." disabled={loading} />
-            <div class="tag-list" onscroll={onTagScroll}>
-              {#each filteredTags as t}
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-                <div class="tag-item" class:selected={selectedTag === t} onclick={() => selectedTag = selectedTag === t ? '' : t} onkeydown={(e) => { if (e.key === 'Enter') selectedTag = selectedTag === t ? '' : t; }} role="option" tabindex="0">{t}</div>
-              {/each}
-              {#if filteredTags.length === 0 && tagFilter.trim()}<div class="dim" style="font-size:10px;padding:6px 10px">No matching tags</div>{/if}
-              {#if loadingTags}<div class="dim" style="font-size:10px;padding:6px 10px">Loading more...</div>{:else if hasMoreTags}<div class="dim" style="font-size:10px;padding:6px 10px">Scroll for more...</div>{/if}
-            </div>
-          {/if}
-        </div>
-        <div class="field"><label for="cname">Name</label><input id="cname" bind:value={customName} placeholder="My custom name" disabled={loading} /><div class="dim" style="font-size:10px;margin-top:4px">Required</div></div>
-        <div style="margin-bottom:12px"><button class="ghost" onclick={() => selectedRepo = ''}>Change image</button></div>
-        <button class="primary" onclick={doLoad} disabled={loading || !customName.trim()}>{loading ? 'Loading...' : 'Load Image'}</button>
-      {/if}
+<div class="modal-overlay" on:click={() => closeLoad()}></div>
+<div class="modal">
+  <h2>Load Image</h2>
+  <button class="ghost small" style="position:absolute;top:8px;right:8px" on:click={() => closeLoad()}>×</button>
+
+  {#if loading}
+    <div class="log-console">
+      {#each loadLogs as line}
+        <div class="log-line">{line}</div>
+      {/each}
     </div>
-  </div>
+    {#if loadStatus === 'done'}
+      <button class="primary small" style="margin-top:8px" on:click={() => closeLoad()}>Close</button>
+    {/if}
+  {:else}
+    {#if !pickedRepo}
+      <input class="search-input" bind:value={searchQuery} on:input={() => doSearch(searchQuery)} placeholder="Search Docker Hub... (e.g., nginx, node, redis)" />
+      {#if searching}<div class="dim" style="padding:8px">Searching...</div>{/if}
+      <div class="search-list">
+        {#each searchResults as r}
+          <div class="search-item" on:click={() => pickRepo(r.name)}>
+            <span class="hi">{r.name}</span>
+            {#if r.is_official}<span class="badge official">official</span>{/if}
+            <span class="dim">★{r.star_count} ↓{r.pull_count}</span>
+          </div>
+        {/each}
+      </div>
+      <button class="ghost small" style="margin-top:8px" on:click={() => showManual = true}>Or enter manually...</button>
+    {:else}
+      <div class="picked-repo">
+        <b>{pickedRepo}{pickedTag ? `:${pickedTag}` : ''}</b>
+        <button class="ghost small" on:click={() => { pickedRepo = ''; pickedTag = ''; showTags = false; }}>Change</button>
+      </div>
+      <input bind:value={loadName} placeholder="Custom name (optional)" style="margin-top:8px" />
+
+      {#if showTags}
+        <input bind:value={tagFilter} placeholder="Filter tags..." style="margin-top:8px" />
+        <div class="tag-list" on:scroll={(e) => { const el = e.currentTarget; if (el.scrollTop + el.clientHeight >= el.scrollHeight - 10) loadMoreTags(); }}>
+          <div class="tag-item {pickedTag === '' ? 'selected' : ''}" on:click={() => pickedTag = ''} style="font-style:italic">(latest)</div>
+          {#each filteredTags() as t}
+            <div class="tag-item {pickedTag === t ? 'selected' : ''}" on:click={() => pickedTag = t}>{t}</div>
+          {/each}
+        </div>
+      {/if}
+
+      <button class="primary" style="margin-top:12px" on:click={doLoad}>Load</button>
+    {/if}
+  {/if}
+
+  {#if showManual}
+    <div class="modal" style="position:fixed;top:20%;left:30%;width:400px;z-index:200">
+      <h3>Enter Image Source</h3>
+      <input bind:value={pickedRepo} placeholder="e.g., nginx:latest, ghcr.io/org/image" style="width:100%" />
+      <div style="margin-top:8px">
+        <button class="ghost small" on:click={() => { showManual = false; showTags = true; }}>OK</button>
+        <button class="ghost small" on:click={() => showManual = false}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+</div>
 {/if}
 
-<!-- MANUAL ENTRY MODAL -->
-{#if showManualModal}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={() => showManualModal = false} onkeydown={(e) => { if (e.key === 'Escape') showManualModal = false; }}>
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-      <div class="modal-head">
-        <span>Manual <em>Entry</em></span>
-        <button class="ghost" onclick={() => showManualModal = false} disabled={manualLoading}>Close</button>
-      </div>
-      {#if manualResult === 'ok'}
-        <div class="msg ok">{manualMsg}</div>
-        <button class="ghost" style="margin-top:12px" onclick={() => showManualModal = false}>Close</button>
-      {:else if manualResult === 'err'}
-        <div class="msg err">{manualMsg}</div>
-        <button class="ghost" style="margin-top:12px" onclick={() => { manualResult = ''; manualMsg = ''; }}>Try again</button>
-      {:else if manualLoading}
-        <div class="field"><label>Source</label><div class="picked-repo">{manualSource}</div></div>
-        <div class="log-console">{#each loadLogs as line}<div class="log-line">{line}</div>{/each}</div>
-        <div class="dim" style="font-size:10px;text-align:center;margin-bottom:8px">Do not close or refresh this page</div>
-      {:else}
-        <div class="field"><label for="msrc">Source</label><input id="msrc" bind:value={manualSource} placeholder="nginx:alpine  or  git URL" disabled={manualLoading} /><div class="dim" style="font-size:10px;margin-top:4px">Docker Hub image:tag, or Git repository URL</div></div>
-        <div class="field"><label for="mname">Name</label><input id="mname" bind:value={manualName} placeholder={manualSource.replace(/[:/@]/g, '-') || 'my-image'} disabled={manualLoading} /><div class="dim" style="font-size:10px;margin-top:4px">Required</div></div>
-        <button class="primary" style="width:100%" onclick={doManualLoad} disabled={manualLoading || !manualSource.trim()}>{manualLoading ? 'Loading...' : 'Load Image'}</button>
-      {/if}
-    </div>
+<!-- New Bridge Modal -->
+{#if showNewBridge}
+<div class="modal-overlay" on:click={() => showNewBridge = false}></div>
+<div class="modal">
+  <h2>New Bridge</h2>
+  <button class="ghost small" style="position:absolute;top:8px;right:8px" on:click={() => showNewBridge = false}>×</button>
+  <div style="margin-top:8px">
+    <input bind:value={newBridgeName} placeholder="Bridge name" />
+    <input bind:value={newBridgeImage} placeholder="Image name" style="margin-top:8px" disabled={newBridgeImage !== ''} />
+    <button class="primary small" style="margin-top:12px" on:click={createBridge}>Create</button>
   </div>
+</div>
 {/if}
+
+<!-- Deploy Modal -->
+{#if showDeploy}
+<div class="modal-overlay" on:click={() => showDeploy = false}></div>
+<div class="modal">
+  <h2>Deploy: {deployBridgeName}</h2>
+  <button class="ghost small" style="position:absolute;top:8px;right:8px" on:click={() => showDeploy = false}>×</button>
+  <div style="margin-top:8px">
+    <div class="dim" style="margin-bottom:8px">Select target node:</div>
+    {#each onlineNodes as n}
+      <label class="radio-row">
+        <input type="radio" bind:group={deployNodeId} value={n.id} />
+        {n.hostname} ({n.os}, {n.cpu_cores} cores, {n.memory_mb}MB)
+      </label>
+    {/each}
+    <button class="primary small" style="margin-top:12px" on:click={doDeploy} disabled={!deployNodeId}>Deploy</button>
+  </div>
+</div>
+{/if}
+
+<style>
+  .page { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; display: flex; align-items: baseline; gap: 6px; }
+  .stat-val { font-size: 20px; font-weight: 700; color: var(--text-hi); }
+  .section { margin-bottom: 32px; }
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .section-head h2, .section-head h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: var(--radius); font-weight: 600; }
+  .badge.loaded { background: var(--surface2); color: var(--text); }
+  .badge.online { background: #064e3b; color: #34d399; }
+  .badge.offline { background: var(--surface2); color: var(--text-dim); }
+  .badge.draft { background: var(--surface2); color: var(--text); }
+  .badge.deployed { background: #1e3a5f; color: #60a5fa; }
+  .badge.direct { background: #4a1e5f; color: #c084fc; }
+  .badge.route { background: #1e3a5f; color: #60a5fa; }
+  .badge.official { background: #1e3a5f; color: #60a5fa; margin-left: 6px; }
+  .actions { text-align: right; white-space: nowrap; }
+  .detail-panel { padding: 12px 16px; background: var(--surface); border-radius: var(--radius); max-width: 600px; }
+  .config-row { display: flex; align-items: center; gap: 8px; }
+  .config-row input, .config-row select { font-family: var(--mono); font-size: 11px; background: var(--bg); border: 1px solid var(--border2); color: var(--text-hi); padding: 5px 8px; border-radius: var(--radius); outline: none; }
+  .config-row input:focus { border-color: #52525b; }
+  .radio-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; font-size: 12px; }
+  .danger { color: var(--red) !important; }
+  .small { font-size: 10px !important; padding: 3px 10px !important; }
+</style>

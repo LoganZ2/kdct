@@ -1,15 +1,13 @@
-//! Connected-client registry.
-//!
-//! When a client connects and sends `ReportNodeStatus`, its entry is updated.
-//! The admin layer queries this registry for client info.
-
 use crate::protocol::{ContainerInfo, ControlChannelCmd, Digest};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::info;
 
-/// Information about a connected client
+pub type ForwardCallback = Box<dyn FnOnce(Box<dyn std::any::Any + Send>) + Send>;
+pub type SyncedCallback = Mutex<Option<ForwardCallback>>;
+
 pub struct ClientEntry {
     pub service_name: String,
     pub hostname: String,
@@ -21,21 +19,18 @@ pub struct ClientEntry {
     pub cpu_cores: u32,
     pub memory_mb: u64,
     pub running_containers: Vec<ContainerInfo>,
-    /// Send commands to this client's control channel
     pub cmd_tx: mpsc::Sender<ControlChannelCmd>,
-    /// Pending Docker response channels, keyed by container_name
     pub pending_docker: Arc<RwLock<HashMap<String, oneshot::Sender<Result<Vec<u16>, String>>>>>,
+    pub data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    pub port_data_callbacks: Arc<RwLock<VecDeque<(SyncedCallback, u16)>>>,
 }
 
-/// Shared client registry, indexed by service digest.
 pub type ClientRegistry = Arc<RwLock<HashMap<Digest, ClientEntry>>>;
 
-/// Create a new empty registry.
 pub fn new_registry() -> ClientRegistry {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Update a client entry when ReportNodeStatus is received.
 pub async fn upsert(
     registry: &ClientRegistry,
     digest: Digest,
@@ -51,6 +46,8 @@ pub async fn upsert(
     running_containers: Vec<ContainerInfo>,
     cmd_tx: mpsc::Sender<ControlChannelCmd>,
     pending_docker: Arc<RwLock<HashMap<String, oneshot::Sender<Result<Vec<u16>, String>>>>>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    port_data_callbacks: Arc<RwLock<VecDeque<(SyncedCallback, u16)>>>,
 ) {
     let mut guard = registry.write().await;
     let is_new = !guard.contains_key(&digest);
@@ -69,6 +66,8 @@ pub async fn upsert(
             running_containers,
             cmd_tx,
             pending_docker,
+            data_ch_req_tx,
+            port_data_callbacks,
         },
     );
     if is_new {
@@ -76,7 +75,6 @@ pub async fn upsert(
     }
 }
 
-/// Remove a client from the registry.
 pub async fn remove(registry: &ClientRegistry, digest: &Digest) {
     if let Some(entry) = registry.write().await.remove(digest) {
         info!("Client disconnected: {}", entry.service_name);

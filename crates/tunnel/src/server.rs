@@ -278,39 +278,57 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 ) -> Result<()> {
     debug!("Try to handshake a data channel");
 
-    let (hint_opts, port_data_pending, data_ch_tx) = {
+    let (hint_opts, port_data_pending, data_ch_tx, port_data_callbacks) = {
         let guard = control_channels.read().await;
         match guard.get2(&nonce) {
             Some(handle) => (
                 Some(SocketOpts::from_server_cfg(&handle.service)),
                 Some(handle.port_data_pending.clone()),
                 Some(handle.data_ch_tx.clone()),
+                Some(handle.port_data_callbacks.clone()),
             ),
             None => {
                 warn!("Data channel has incorrect nonce");
-                (None, None, None)
+                (None, None, None, None)
             }
         }
     };
 
-    let (hint_opts, port_data_pending, data_ch_tx) = match (hint_opts, port_data_pending, data_ch_tx) {
-        (Some(h), Some(p), Some(tx)) => (h, p, tx),
+    let (hint_opts, port_data_pending, data_ch_tx, port_data_callbacks) = match (hint_opts, port_data_pending, data_ch_tx, port_data_callbacks) {
+        (Some(h), Some(p), Some(tx), Some(cb)) => (h, p, tx, cb),
         _ => return Ok(()),
     };
 
     T::hint(&conn, hint_opts);
 
-    let mut pending = port_data_pending.write().await;
-    if let Some((sender, _local_port)) = pending.pop_front() {
-        drop(pending);
-        let _ = sender.send(conn);
-    } else {
-        drop(pending);
-        data_ch_tx
-            .send(conn)
-            .await
-            .with_context(|| "Data channel for a stale control channel")?;
+    // First check generic port_data_pending
+    {
+        let mut pending = port_data_pending.write().await;
+        if let Some((sender, _local_port)) = pending.pop_front() {
+            drop(pending);
+            let _ = sender.send(conn);
+            return Ok(());
+        }
     }
+
+    // Then check type-erased callbacks
+    {
+        let mut pending = port_data_callbacks.write().await;
+        if let Some((cb, _local_port)) = pending.pop_front() {
+            drop(pending);
+            let mut guard = cb.lock().unwrap();
+            if let Some(cb) = guard.take() {
+                cb(Box::new(conn));
+            }
+            return Ok(());
+        }
+    }
+
+    data_ch_tx
+        .send(conn)
+        .await
+        .with_context(|| "Data channel for a stale control channel")?;
+
     Ok(())
 }
 
@@ -321,6 +339,7 @@ pub struct ControlChannelHandle<T: Transport> {
     /// Send commands to this client's control channel
     pub cmd_tx: mpsc::Sender<ControlChannelCmd>,
     port_data_pending: Arc<RwLock<std::collections::VecDeque<(tokio::sync::oneshot::Sender<T::Stream>, u16)>>>,
+    pub port_data_callbacks: Arc<RwLock<std::collections::VecDeque<(crate::registry::SyncedCallback, u16)>>>,
     pub node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
 }
 
@@ -405,6 +424,7 @@ where
         };
 
         let port_data_pending = Arc::new(RwLock::new(VecDeque::new()));
+        let port_data_callbacks = Arc::new(RwLock::new(VecDeque::new()));
 
         let service_name = service.name.clone();
         let ch = ControlChannel::<T> {
@@ -418,6 +438,7 @@ where
             service_name,
             clients,
             port_data_pending: port_data_pending.clone(),
+            port_data_callbacks: port_data_callbacks.clone(),
             port_pool,
             data_ch_req_tx: data_ch_req_tx_for_control,
             shutdown_tx: shutdown_tx.clone(),
@@ -443,6 +464,7 @@ where
             service,
             cmd_tx,
             port_data_pending,
+            port_data_callbacks,
             node_update_tx,
         }
     }
@@ -459,6 +481,7 @@ struct ControlChannel<T: Transport> {
     service_name: String,
     clients: ClientRegistry,
     port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>,
+    port_data_callbacks: Arc<RwLock<VecDeque<(crate::registry::SyncedCallback, u16)>>>,
     port_pool: Option<Arc<crate::port_pool::PortPool>>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_tx: broadcast::Sender<bool>,
@@ -505,6 +528,8 @@ impl<T: Transport> ControlChannel<T> {
                                 running_containers.clone(),
                                 self.cmd_tx.clone(),
                                 self.pending_docker.clone(),
+                                self.data_ch_req_tx.clone(),
+                                self.port_data_callbacks.clone(),
                             ).await;
 
                             let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
@@ -643,17 +668,17 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
-#[allow(dead_code)]
-fn spawn_port_accept_loop<T: Transport>(
+pub fn spawn_port_accept_loop(
     pool: Arc<crate::port_pool::PortPool>,
     server_port: u16,
     local_port: u16,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>,
+    port_data_callbacks: Arc<RwLock<VecDeque<(crate::registry::SyncedCallback, u16)>>>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) {
     tokio::spawn(
         async move {
+            use tokio::net::TcpStream;
             loop {
                 tokio::select! {
                     result = pool.accept(server_port) => {
@@ -663,8 +688,14 @@ fn spawn_port_accept_loop<T: Transport>(
                                 if data_ch_req_tx.send(true).is_err() {
                                     break;
                                 }
-                                let (tx, rx) = oneshot::channel::<T::Stream>();
-                                port_data_pending.write().await.push_back((tx, local_port));
+                                let (tx, rx) = oneshot::channel::<TcpStream>();
+                                let cb: crate::registry::ForwardCallback = Box::new(move |stream: Box<dyn std::any::Any + Send>| {
+                                    if let Ok(tcp) = stream.downcast::<TcpStream>() {
+                                        let _ = tx.send(*tcp);
+                                    }
+                                });
+                                let synced = std::sync::Mutex::new(Some(cb));
+                                port_data_callbacks.write().await.push_back((synced, local_port));
                                 match rx.await {
                                     Ok(mut data_ch) => {
                                         if let Err(e) = protocol::write_data_cmd(
