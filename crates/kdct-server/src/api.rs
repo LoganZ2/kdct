@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -397,33 +395,12 @@ pub async fn run_api(
                         let mut log_line = |line: &str| {
                             if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.logs.push(line.to_string()); } }
                         };
-                        log_line(&format!("Pulling: {}", source));
-                        let is_docker = !(source.starts_with("http") || source.ends_with(".git"));
-                        if is_docker {
-                            match tokio::process::Command::new("docker").args(["pull", &source]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-                                Ok(mut child) => {
-                                    if let Some(stderr) = child.stderr.take() {
-                                        let reader = BufReader::new(stderr);
-                                        let mut lines = reader.lines();
-                                        while let Ok(Some(line)) = lines.next_line().await {
-                                            let trimmed = line.trim().to_string();
-                                            if !trimmed.is_empty() { log_line(&trimmed); }
-                                        }
-                                    }
-                                    let status = child.wait().await;
-                                    match status {
-                                        Ok(s) if s.success() => log_line("Pull complete"),
-                                        Ok(s) => log_line(&format!("Pull failed with code: {}", s.code().unwrap_or(-1))),
-                                        Err(e) => log_line(&format!("Pull error: {}", e)),
-                                    }
-                                }
-                                Err(e) => {
-                                    log_line(&format!("Failed to start docker: {}", e));
-                                    if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.status = "error".into(); job.result = format!("{}", e); } }
-                                    return;
-                                }
-                            }
+                        log_line(&format!("Loading: {}", source));
+
+                        if source.starts_with("http") || source.ends_with(".git") {
+                            log_line("Cloning git repository...");
                         }
+
                         match image::load_image(db.as_ref(), &source, custom_name.as_deref()).await {
                             Ok(name) => {
                                 if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.status = "done".into(); job.result = format!("Image {} loaded successfully", name); } }
@@ -446,21 +423,6 @@ pub async fn run_api(
                     match jobs.get(&job_id) {
                         Some(job) => respond_json(&json!({ "status": job.status, "logs": job.logs, "result": job.result })),
                         None => error_json("Job not found", 404),
-                    }
-                }
-
-                // ── Image ports inspection ──────────────────────────
-                (&tiny_http::Method::Get, p) if p.starts_with("/api/image/ports") => {
-                    let query = raw_path.split('?').nth(1).and_then(|qs| qs.split('&').find_map(|pair| {
-                        let mut kv = pair.splitn(2, '=');
-                        if kv.next()? == "image" { kv.next().map(|s| s.to_string()) } else { None }
-                    })).unwrap_or_default();
-                    if query.is_empty() { respond_json(&json!([])) }
-                    else {
-                        match handle.block_on(image::inspect_exposed_ports(&query)) {
-                            Ok(ports) => respond_json(&json!(ports)),
-                            Err(e) => error_json(&format!("{:#}", e), 500),
-                        }
                     }
                 }
 

@@ -29,53 +29,28 @@ pub async fn load_image(db: &Database, source: &str, custom_name: Option<&str>) 
 
     info!("Loading image: {} (type: {})", name, source_type);
 
-    if source_type == "docker_hub" {
-        let status = tokio::process::Command::new("docker")
-            .args(["pull", source])
-            .status()
-            .await
-            .context("Failed to pull Docker image")?;
-
-        if !status.success() {
-            bail!("docker pull failed for {}", source);
-        }
-    } else {
-        let _ = tokio::process::Command::new("git")
+    if source_type == "git" {
+        let output = tokio::process::Command::new("git")
             .args(["clone", "--depth", "1", source])
             .arg(format!("/tmp/kdct-build-{}", name))
-            .status()
-            .await;
+            .output()
+            .await
+            .context("Failed to clone git repository")?;
+
+        if !output.status.success() {
+            bail!("git clone failed for {}", source);
+        }
+
+        let dockerfile_path = format!("/tmp/kdct-build-{}/Dockerfile", name);
+        if !std::path::Path::new(&dockerfile_path).exists() {
+            bail!(
+                "No Dockerfile found in {}. A Dockerfile is required for Git-sourced images.",
+                source
+            );
+        }
     }
 
     db.insert_image(&name, source, source_type)?;
     info!("Image {} loaded", name);
     Ok(name)
-}
-
-pub async fn inspect_exposed_ports(image: &str) -> Result<Vec<i64>> {
-    let output = tokio::process::Command::new("docker")
-        .args(["inspect", image])
-        .output()
-        .await
-        .context("Failed to inspect Docker image")?;
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).context("Failed to parse docker inspect JSON")?;
-
-    let config = &json[0]["Config"]["ExposedPorts"];
-    let ports: Vec<i64> = config
-        .as_object()
-        .map(|obj| {
-            obj.keys()
-                .filter_map(|k| k.split('/').next()?.parse::<i64>().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(ports)
 }
