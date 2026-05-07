@@ -82,7 +82,8 @@ pub async fn deploy_connection(
         client_port += 1;
     }
 
-    let container_name = connection_name.replace(['/', ':'], "-");
+    let safe_name = connection_name.replace(['/', ':'], "-");
+    let container_name = format!("kdct-{}-{}", safe_name, connection_id);
 
     let (node_digest, cmd_tx, pending_docker, data_ch_req_tx, port_data_callbacks) = {
         let guard = registry.read().await;
@@ -99,11 +100,44 @@ pub async fn deploy_connection(
     let image_tag = match image.source_type.as_str() {
         "git" => {
             let tag = format!("kdct:{}", image.name.replace('/', "-"));
+            let build_key = format!("build:{}", tag);
+
+            // Register a oneshot for the build completion before sending the command,
+            // so DockerBuildProgress on the control channel can resolve it.
+            let (build_tx, build_rx) = oneshot::channel::<Result<Vec<u16>, String>>();
+            {
+                let mut pending = pending_docker.write().await;
+                pending.insert(build_key.clone(), build_tx);
+            }
+
             cmd_tx.send(ControlChannelCmd::DockerBuild {
                 git_url: image.source.clone(),
                 branch: "main".into(),
                 image_tag: tag.clone(),
             }).await.context("Failed to send DockerBuild command")?;
+
+            info!("DockerBuild sent for '{}', waiting for build to complete...", tag);
+
+            // Builds can take a while — give it 10 minutes.
+            match time::timeout(Duration::from_secs(600), build_rx).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(err_msg))) => {
+                    pending_docker.write().await.remove(&build_key);
+                    for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
+                    return Err(anyhow::anyhow!("Image build failed: {}", err_msg));
+                }
+                Ok(Err(_)) => {
+                    pending_docker.write().await.remove(&build_key);
+                    for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
+                    return Err(anyhow::anyhow!("Build channel closed before completion"));
+                }
+                Err(_elapsed) => {
+                    pending_docker.write().await.remove(&build_key);
+                    for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
+                    return Err(anyhow::anyhow!("Timeout waiting for image '{}' to build", tag));
+                }
+            }
+
             tag
         }
         _ => image.source.clone(),
@@ -224,9 +258,7 @@ pub async fn stop_connection(
 
     // Clean up routes + pool ports
     if let Some(digest_hex) = node_id.and_then(|nid| {
-        db.get_node_by_id(nid).ok().flatten().map(|n|
-            hex::encode(n.auth_digest.unwrap_or_default())
-        )
+        db.get_node_by_id(nid).ok().flatten().and_then(|n| n.auth_digest)
     }) {
         if let Some(deployment) = crate::deployment_tracker::get_deployment(tracker, &connection_name, &digest_hex).await {
             let mut table = route_table.write().await;

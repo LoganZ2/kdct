@@ -229,9 +229,9 @@ pub async fn run_api(
                     let name = parsed["name"].as_str().unwrap_or("connection").to_string();
                     match db.insert_connection(&name) {
                         Ok(id) => {
-                            let bridge_id = parsed["bridge_id"].as_i64();
-                            let image_id = parsed["image_id"].as_i64();
-                            let node_id = parsed["node_id"].as_i64();
+                            let bridge_id = parse_slot(&parsed, "bridge_id");
+                            let image_id = parse_slot(&parsed, "image_id");
+                            let node_id = parse_slot(&parsed, "node_id");
                             if bridge_id.is_some() || image_id.is_some() || node_id.is_some() {
                                 let _ = db.update_connection(id, bridge_id, image_id, node_id);
                             }
@@ -257,12 +257,12 @@ pub async fn run_api(
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
                     let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
-                    let bridge_id = parsed["bridge_id"].as_i64();
-                    let image_id = parsed["image_id"].as_i64();
-                    let node_id = parsed["node_id"].as_i64();
-                    let current_bridge = parsed.get("bridge_id").is_some();
-                    let current_image = parsed.get("image_id").is_some();
-                    let current_node = parsed.get("node_id").is_some();
+                    let bridge_id = parse_slot(&parsed, "bridge_id");
+                    let image_id = parse_slot(&parsed, "image_id");
+                    let node_id = parse_slot(&parsed, "node_id");
+                    let _current_bridge = bridge_id.is_some();
+                    let _current_image = image_id.is_some();
+                    let current_node = node_id.is_some();
                     // If node changed and we were deployed, stop first
                     if current_node {
                         if let Ok(Some(conn)) = db.get_connection(id) {
@@ -481,6 +481,18 @@ async fn stop_connection_safe(
     }
 }
 
+/// Parse a slot field from a JSON body for `update_connection`'s tri-state.
+/// - missing key       → `None` (don't touch the column)
+/// - explicit `null`   → `Some(None)` (clear the column to NULL)
+/// - integer value     → `Some(Some(n))`
+fn parse_slot(v: &serde_json::Value, key: &str) -> Option<Option<i64>> {
+    match v.get(key) {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(other) => other.as_i64().map(Some),
+    }
+}
+
 fn extract_bridge_id(path: &str, suffix: &str) -> Option<i64> {
     let strip = path.strip_prefix("/api/bridges/")?.strip_suffix(suffix)?;
     strip.parse().ok()
@@ -500,14 +512,30 @@ fn error_json(msg: &str, code: u16) -> Resp {
 }
 
 fn serve_static(panel_dir: &PathBuf, path: &str, _registry: &ClientRegistry) -> Resp {
-    let path = path.trim_start_matches('/');
+    let path = percent_decode(path.trim_start_matches('/'));
     if path.is_empty() { return serve_file_or_fallback(panel_dir, "index.html"); }
-    let file_path = panel_dir.join(path);
-    if file_path.exists() && file_path.is_file() { return serve_file(&file_path, path); }
+    // Reject paths with traversal components — only allow plain segments.
+    if path.split('/').any(|seg| seg == ".." || seg == ".") {
+        return serve_file_or_fallback(panel_dir, "index.html");
+    }
+    let safe = |p: &PathBuf| -> bool {
+        match (p.canonicalize(), panel_dir.canonicalize()) {
+            (Ok(c), Ok(root)) => c.starts_with(&root),
+            _ => false,
+        }
+    };
+    let file_path = panel_dir.join(&path);
+    if file_path.exists() && file_path.is_file() && safe(&file_path) {
+        return serve_file(&file_path, &path);
+    }
     let html_path = panel_dir.join(format!("{}.html", path));
-    if html_path.exists() { return serve_file(&html_path, &format!("{}.html", path)); }
-    let index_path = panel_dir.join(path).join("index.html");
-    if index_path.exists() { return serve_file(&index_path, "index.html"); }
+    if html_path.exists() && safe(&html_path) {
+        return serve_file(&html_path, &format!("{}.html", path));
+    }
+    let index_path = panel_dir.join(&path).join("index.html");
+    if index_path.exists() && safe(&index_path) {
+        return serve_file(&index_path, "index.html");
+    }
     serve_file_or_fallback(panel_dir, "index.html")
 }
 

@@ -122,9 +122,13 @@ pub async fn run_proxy(
 
     let mut service = http_proxy_service(&my_server.configuration, proxy);
 
-    let mut addrs = vec![format!("0.0.0.0:{}", http_port)];
+    let addrs = vec![format!("0.0.0.0:{}", http_port)];
     if https_port != 0 {
-        addrs.push(format!("0.0.0.0:{}", https_port));
+        warn!(
+            "https_port={} is set but TLS termination is not implemented yet — ignoring. \
+             Run KDCT behind a TLS-terminating proxy (Caddy/nginx/Cloudflare) for HTTPS.",
+            https_port
+        );
     }
     service.add_tcp(&addrs.join(","));
 

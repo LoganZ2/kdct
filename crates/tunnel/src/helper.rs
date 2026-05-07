@@ -86,7 +86,6 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
     };
     let s = UdpSocket::bind(bind_addr).await?;
     s.connect(socket_addr).await?;
-    s.connect(socket_addr).await?;
     Ok(s)
 }
 

@@ -324,11 +324,17 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn update_connection(&self, connection_id: i64, bridge_id: Option<i64>, image_id: Option<i64>, node_id: Option<i64>) -> Result<()> {
+    /// Update a connection's slot fields.
+    ///
+    /// Each argument is tri-state:
+    /// - `None`         → leave the column unchanged
+    /// - `Some(None)`   → set the column to NULL
+    /// - `Some(Some(x))`→ set the column to `x`
+    pub fn update_connection(&self, connection_id: i64, bridge_id: Option<Option<i64>>, image_id: Option<Option<i64>>, node_id: Option<Option<i64>>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let mut current_bridge = None;
-        let mut current_image = None;
-        let mut current_node = None;
+        let mut current_bridge: Option<i64> = None;
+        let mut current_image: Option<i64> = None;
+        let mut current_node: Option<i64> = None;
         {
             let mut stmt = conn.prepare("SELECT bridge_id, image_id, node_id FROM connections WHERE id=?1")?;
             let mut rows = stmt.query_map(params![connection_id], |row| {
@@ -340,9 +346,9 @@ impl Database {
                 current_node = n;
             }
         }
-        let final_bridge = bridge_id.or(current_bridge);
-        let final_image = image_id.or(current_image);
-        let final_node = node_id.or(current_node);
+        let final_bridge = bridge_id.unwrap_or(current_bridge);
+        let final_image = image_id.unwrap_or(current_image);
+        let final_node = node_id.unwrap_or(current_node);
         conn.execute(
             "UPDATE connections SET bridge_id=?1, image_id=?2, node_id=?3 WHERE id=?4",
             params![final_bridge, final_image, final_node, connection_id],
