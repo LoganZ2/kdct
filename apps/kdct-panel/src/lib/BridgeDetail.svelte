@@ -6,7 +6,7 @@
     onrefresh?: () => void;
   } = $props();
 
-  let portContainerPort = $state(0);
+  let portContainerPort = $state('');
   let portMode = $state('route');
   let portRoutePath = $state('');
   let portProtocols: string[] = $state(['tcp']);
@@ -19,21 +19,23 @@
   let envMsg = $state('');
 
   async function addPort() {
-    if (!portContainerPort) return;
+    const portNum = parseInt(portContainerPort);
+    if (!portNum) { portMsg = 'Enter a port number'; return; }
     if (portMode === 'route' && !portRoutePath.startsWith('/')) { portMsg = 'Path must start with /'; return; }
     portMsg = '';
     try {
-      const body: any = { container_port: portContainerPort, mode: portMode };
+      const body: any = { container_port: portNum, mode: portMode };
       if (portMode === 'route') body.route_path = portRoutePath;
       if (portMode === 'direct') body.protocols = portProtocols;
       const res = await fetch(`/api/bridges/${bridgeId}/port`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
+      const text = await res.text();
       if (res.ok) {
-        portContainerPort = 0; portRoutePath = ''; addingPort = false; portProtocols = ['tcp'];
+        portContainerPort = ''; portRoutePath = ''; addingPort = false; portProtocols = ['tcp'];
         onrefresh();
-      } else { portMsg = await res.text(); }
-    } catch (e: any) { portMsg = e.message; }
+      } else { portMsg = text || `Error ${res.status}`; }
+    } catch (e: any) { portMsg = e.message || 'Network error'; }
   }
 
   async function deletePort(containerPort: number) {
@@ -106,7 +108,7 @@
     </div>
     {#if portMsg}<div class="dim" style="font-size:10px;color:var(--red)">{portMsg}</div>{/if}
   {:else}
-    <button class="ghost" onclick={() => { addingPort = true; portContainerPort = 0; portMode = 'route'; portRoutePath = ''; portProtocols = ['tcp']; portMsg = ''; }} style="margin-bottom:8px">+ Add Port</button>
+    <button class="ghost" onclick={() => { addingPort = true; portContainerPort = ''; portMode = 'route'; portRoutePath = ''; portProtocols = ['tcp']; portMsg = ''; }} style="margin-bottom:8px">+ Add Port</button>
   {/if}
 
   <!-- Envs -->
