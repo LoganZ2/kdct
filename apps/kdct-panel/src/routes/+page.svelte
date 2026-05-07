@@ -15,7 +15,6 @@
   let newBridgeName = $state('');
 
   let expandedBridge = $state<number | null>(null);
-  let bridgeDetail = $state<any>(null);
 
   let timer: any = null;
 
@@ -29,22 +28,12 @@
         fetch('/api/connections').then(r => r.json()),
       ]);
       overview = ov; images = im; nodes = nd; bridges = br; connections = cn; err = '';
-      if (expandedBridge) refreshBridgeDetail(expandedBridge);
     } catch { err = 'Cannot reach kdct server'; }
   }
 
   async function autoCheck() {
     try { await fetch('/api/auto-check', { method: 'POST' }); } catch {}
     refresh();
-  }
-
-  async function refreshBridgeDetail(id: number) {
-    try { bridgeDetail = await fetch(`/api/bridges/${id}`).then(r => r.json()); } catch { bridgeDetail = null; }
-  }
-
-  function toggleBridge(id: number) {
-    if (expandedBridge === id) { expandedBridge = null; bridgeDetail = null; return; }
-    expandedBridge = id; bridgeDetail = null; refreshBridgeDetail(id);
   }
 
   onMount(() => { refresh(); timer = setInterval(autoCheck, 5000); });
@@ -61,7 +50,7 @@
   async function deleteBridge(id: number) {
     if (!confirm('Delete this bridge?')) return;
     await fetch(`/api/bridges/${id}`, { method: 'DELETE' });
-    if (expandedBridge === id) { expandedBridge = null; bridgeDetail = null; }
+    if (expandedBridge === id) { expandedBridge = null; }
     refresh();
   }
 
@@ -173,9 +162,9 @@
             <td><span class="badge loaded">{br.status}</span></td>
             <td class="actions"><button class="ghost danger" onclick={() => deleteBridge(br.id)}>×</button></td>
           </tr>
-          {#if expandedBridge === br.id && bridgeDetail}
+          {#if expandedBridge === br.id}
             <tr><td colspan="3">
-              <BridgeDetail bridgeId={br.id} {bridgeDetail} onlineNodes={online} onrefresh={() => refreshBridgeDetail(br.id)} />
+              <BridgeDetail bridgeId={br.id} onlineNodes={online} />
             </td></tr>
           {/if}
         {/each}

@@ -1,10 +1,11 @@
 <script lang="ts">
-  let { bridgeId, detail, onlineNodes = [], onrefresh = () => {} }: {
+  let { bridgeId, onlineNodes = [] }: {
     bridgeId: number;
-    detail: any;
     onlineNodes?: any[];
-    onrefresh?: () => void;
   } = $props();
+
+  let detail = $state<any>(null);
+  let loading = $state(false);
 
   let portContainerPort = $state('');
   let portMode = $state('route');
@@ -17,6 +18,15 @@
   let envVal = $state('');
   let addingEnv = $state(false);
   let envMsg = $state('');
+
+  async function refresh() {
+    loading = true;
+    try { detail = await fetch(`/api/bridges/${bridgeId}`).then(r => r.json()); }
+    catch { detail = null; }
+    loading = false;
+  }
+
+  $effect(() => { refresh(); });
 
   async function addPort() {
     const portNum = parseInt(portContainerPort);
@@ -33,14 +43,14 @@
       const text = await res.text();
       if (res.ok) {
         portContainerPort = ''; portRoutePath = ''; addingPort = false; portProtocols = ['tcp'];
-        onrefresh();
+        refresh();
       } else { portMsg = text || `Error ${res.status}`; }
     } catch (e: any) { portMsg = e.message || 'Network error'; }
   }
 
   async function deletePort(containerPort: number) {
     await fetch(`/api/bridges/${bridgeId}/port/${containerPort}`, { method: 'DELETE' });
-    onrefresh();
+    refresh();
   }
 
   async function addEnv() {
@@ -53,7 +63,7 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });
-      if (res.ok) { envKey = ''; envVal = ''; addingEnv = false; onrefresh(); }
+      if (res.ok) { envKey = ''; envVal = ''; addingEnv = false; refresh(); }
       else { envMsg = await res.text(); }
     } catch (e: any) { envMsg = e.message; }
   }
@@ -66,13 +76,15 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });
-      onrefresh();
+      refresh();
     } catch {}
   }
 </script>
 
+{#if loading && !detail}
+  <div class="dim" style="padding:12px">Loading...</div>
+{:else}
 <div class="detail-panel">
-  <!-- Ports -->
   <div class="section-head" style="margin-bottom:8px"><h3>Ports</h3></div>
   {#if detail?.ports?.length}
     <table style="margin-bottom:8px">
@@ -111,7 +123,6 @@
     <button class="ghost" onclick={() => { addingPort = true; portContainerPort = ''; portMode = 'route'; portRoutePath = ''; portProtocols = ['tcp']; portMsg = ''; }} style="margin-bottom:8px">+ Add Port</button>
   {/if}
 
-  <!-- Envs -->
   <div class="section-head" style="margin-bottom:8px;margin-top:16px"><h3>Environment</h3></div>
   {#if detail?.envs?.length}
     <table style="margin-bottom:8px">
@@ -134,7 +145,5 @@
   {:else}
     <button class="ghost" onclick={() => { addingEnv = true; envKey = ''; envVal = ''; envMsg = ''; }}>+ Add Env</button>
   {/if}
-
-  <!-- Deploy info removed — connections handle deployment -->
 </div>
-
+{/if}
