@@ -57,7 +57,7 @@
       <span>{nodes.length} total / {nodes.filter(n => n.status === 'online').length} online</span>
     </div>
     {#if nodes.length === 0}
-      <div class="empty">No nodes registered. Start a client: <code>kdctc --config client.toml</code></div>
+      <div class="empty">No nodes registered. Launch a KDCT client on your target machines.</div>
     {:else}
       <table>
         <thead><tr>
@@ -89,7 +89,7 @@
       <span>{images.length} loaded</span>
     </div>
     {#if images.length === 0}
-      <div class="empty">No images loaded. Use: <code>kdcts image load &lt;source&gt;</code></div>
+      <div class="empty">No images loaded. Go to the Images tab to load a Docker image or Git repository.</div>
     {:else}
       <table>
         <thead><tr>

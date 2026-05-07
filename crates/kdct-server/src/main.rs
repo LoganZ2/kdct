@@ -1,15 +1,12 @@
-mod admin;
 mod api;
 mod db;
 mod deploy;
 mod deployment_tracker;
 mod image;
-mod interactive;
-mod node;
 mod proxy;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use tunnel::config::{Config, TransportType};
 use tunnel::port_pool::PortPool;
 use tunnel::server::Server;
@@ -25,100 +22,11 @@ use crate::proxy::RouteTable;
 use tunnel::node_update::NodeEvent;
 
 #[derive(Parser)]
-#[command(name = "kdcts", about = "KDCT Docker Container Tunnel Server")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the server daemon
-    Start {
-        /// Path to server config TOML
-        #[arg(long, default_value = "server.toml")]
-        config: PathBuf,
-    },
-    /// Load a Docker image and inspect its EXPOSE ports
-    Image {
-        #[command(subcommand)]
-        action: ImageCmd,
-    },
-    /// Manage connected client nodes
-    Node {
-        #[command(subcommand)]
-        action: NodeCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum ImageCmd {
-    /// Load an image from Docker Hub or Git URL
-    Load {
-        /// Image source (e.g. nginx:latest, or git URL)
-        source: String,
-    },
-    /// Add port mappings or env vars to an image
-    Config {
-        /// Image name
-        name: String,
-        /// Additional port mappings (HOST:CONTAINER)
-        #[arg(short = 'p', long = "port")]
-        ports: Vec<String>,
-        /// Environment variables (KEY=VALUE, repeatable)
-        #[arg(short = 'e', long = "env")]
-        env: Vec<String>,
-    },
-    /// List all loaded images
-    List,
-    /// Show image details and route configuration
-    Show {
-        /// Image name
-        name: String,
-    },
-    /// Deploy an image to a client node
-    Deploy {
-        /// Image name
-        name: String,
-        /// Target node ID
-        #[arg(long = "to")]
-        node_id: i64,
-    },
-    /// Stop a deployed image on a node
-    Stop {
-        /// Image name
-        name: String,
-        /// Target node ID
-        #[arg(long = "to")]
-        node_id: i64,
-    },
-    /// List active deployments
-    Deployments,
-}
-
-#[derive(Subcommand)]
-enum NodeCmd {
-    /// List all client nodes
-    List,
-    /// Show node details
-    Show {
-        /// Node ID
-        id: i64,
-    },
-}
-
-fn parse_port_mapping(s: &str) -> anyhow::Result<(i64, i64)> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 {
-        bail!("Invalid port mapping: '{}'. Use HOST:CONTAINER format.", s);
-    }
-    let host: i64 = parts[0]
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid host port: '{}'", parts[0]))?;
-    let container: i64 = parts[1]
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid container port: '{}'", parts[1]))?;
-    Ok((host, container))
+#[command(name = "kdcts")]
+struct Args {
+    /// Path to server config TOML
+    #[arg(long, default_value = "server.toml")]
+    config: PathBuf,
 }
 
 #[tokio::main]
@@ -135,69 +43,8 @@ async fn main() -> Result<()> {
 
     check_docker().await?;
 
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Start { config } => {
-            start_server(config).await?;
-        }
-        Commands::Image { action } => match action {
-            ImageCmd::Load { source } => {
-                let db = Database::open(&PathBuf::from("kdct.db"))?;
-                let name = image::load_image(&db, &source).await?;
-                interactive::configure_routes_interactive(&db, &name, &[]).await?;
-            }
-            ImageCmd::Config { name, ports, env } => {
-                let db = Database::open(&PathBuf::from("kdct.db"))?;
-                for p in &ports {
-                    let (_host, container) = parse_port_mapping(p)?;
-                    image::add_port_mapping(&db, &name, _host, container).await?;
-                }
-                interactive::configure_routes_interactive(&db, &name, &env).await?;
-            }
-            ImageCmd::List => {
-                let db = Database::open(&PathBuf::from("kdct.db"))?;
-                let images = db.list_images()?;
-                if images.is_empty() {
-                    println!("No images loaded.");
-                } else {
-                    println!("{:<20} {:<15} {:<15} {}", "NAME", "SOURCE", "TYPE", "STATUS");
-                    for img in &images {
-                        println!(
-                            "{:<20} {:<15} {:<15} {}",
-                            img.name, img.source, img.source_type, img.status
-                        );
-                    }
-                }
-            }
-            ImageCmd::Show { name } => {
-                let db = Database::open(&PathBuf::from("kdct.db"))?;
-                image::show_image(&db, &name)?;
-            }
-            ImageCmd::Deploy { name, node_id } => {
-                let cmd = format!("deploy {} {}", name, node_id);
-                admin::admin_request(&cmd).await?;
-            }
-            ImageCmd::Stop { name, node_id } => {
-                let cmd = format!("stop {} {}", name, node_id);
-                admin::admin_request(&cmd).await?;
-            }
-            ImageCmd::Deployments => {
-                admin::admin_request("deployments").await?;
-            }
-        },
-        Commands::Node { action } => {
-            let db = Database::open(&PathBuf::from("kdct.db"))?;
-            match action {
-                NodeCmd::List => {
-                    node::list_nodes(&db)?;
-                }
-                NodeCmd::Show { id } => {
-                    node::show_node(&db, id)?;
-                }
-            }
-        }
-    }
+    let args = Args::parse();
+    start_server(args.config).await?;
 
     Ok(())
 }
@@ -338,7 +185,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let api_docker_results = docker_results.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    api::run_api(api_db, api_clients, api_rt, api_pool, api_tracker, api_docker_results).await
+                    api::run_api(api_db, api_clients, api_rt, api_pool, api_tracker, api_docker_results, Default::default()).await
                 {
                     tracing::error!("API error: {:#}", e);
                 }

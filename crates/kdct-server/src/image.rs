@@ -4,25 +4,28 @@ use tracing::info;
 use crate::db::Database;
 
 /// Load a Docker image (from Docker Hub or Git) and inspect its EXPOSE ports.
-pub async fn load_image(db: &Database, source: &str) -> Result<String> {
+pub async fn load_image(db: &Database, source: &str, custom_name: Option<&str>) -> Result<String> {
     let source_type = if source.starts_with("http") || source.ends_with(".git") {
         "git"
     } else {
         "docker_hub"
     };
 
-    let name = match source_type {
-        "docker_hub" => source.to_string(),
-        "git" => {
-            // Extract repo name from git URL
-            source
-                .rsplit('/')
-                .next()
-                .unwrap_or(source)
-                .trim_end_matches(".git")
-                .to_string()
+    let name = if let Some(n) = custom_name {
+        n.to_string()
+    } else {
+        match source_type {
+            "docker_hub" => source.to_string(),
+            "git" => {
+                source
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(source)
+                    .trim_end_matches(".git")
+                    .to_string()
+            }
+            _ => source.to_string(),
         }
-        _ => source.to_string(),
     };
 
     info!("Loading image: {} (type: {})", name, source_type);

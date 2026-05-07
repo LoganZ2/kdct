@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -21,6 +23,15 @@ const API_PORT: u16 = 9933;
 
 type Resp = tiny_http::Response<Cursor<Vec<u8>>>;
 
+#[derive(Clone)]
+pub struct LoadJob {
+    pub logs: Vec<String>,
+    pub status: String,
+    pub result: String,
+}
+
+pub type JobRegistry = Arc<Mutex<HashMap<String, LoadJob>>>;
+
 fn panel_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/kdct-panel/build")
@@ -33,11 +44,13 @@ pub async fn run_api(
     pool: Arc<PortPool>,
     tracker: DeploymentTracker,
     docker_results: Arc<RwLock<HashMap<String, Result<Vec<u16>, String>>>>,
+    job_registry: JobRegistry,
 ) -> Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", API_PORT))?;
     let server = tiny_http::Server::from_listener(listener, None)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let panel = panel_dir();
+    let job_registry = job_registry.clone();
     info!("Panel API listening on http://127.0.0.1:{}", API_PORT);
     info!("Serving panel from: {}", panel.display());
 
@@ -51,10 +64,10 @@ pub async fn run_api(
                 }
             };
 
-            let path = request.url().to_string();
+            let raw_path = request.url().to_string();
             let method = request.method();
 
-            let path = path.split('?').next().unwrap_or(&path).to_string();
+            let path = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
 
             let handle = Handle::current();
 
@@ -173,7 +186,7 @@ pub async fn run_api(
                 }
 
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/search") => {
-                    let query = p.split('?').nth(1).and_then(|qs| {
+                    let query = raw_path.split('?').nth(1).and_then(|qs| {
                         qs.split('&').find_map(|pair| {
                             let mut kv = pair.splitn(2, '=');
                             if kv.next()? == "q" { kv.next().map(|s| s.to_string()) } else { None }
@@ -189,6 +202,25 @@ pub async fn run_api(
                     }
                 }
 
+                (&tiny_http::Method::Get, p) if p.starts_with("/api/tags") => {
+                    let params: HashMap<String, String> = raw_path.split('?').nth(1).map(|qs| {
+                        qs.split('&').filter_map(|pair| {
+                            let mut kv = pair.splitn(2, '=');
+                            Some((kv.next()?.to_string(), kv.next().unwrap_or("").to_string()))
+                        }).collect()
+                    }).unwrap_or_default();
+                    let repo = params.get("repo").cloned().unwrap_or_default();
+                    let page: u32 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
+                    if repo.is_empty() {
+                        respond_json(&json!({"tags": [], "next": null}))
+                    } else {
+                        match fetch_tags(&repo, page) {
+                            Ok(result) => respond_json(&json!(result)),
+                            Err(e) => error_json(&format!("{:#}", e), 500),
+                        }
+                    }
+                }
+
                 (&tiny_http::Method::Post, "/api/image/load") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -199,15 +231,123 @@ pub async fn run_api(
                         Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
                     };
                     let source = parsed["source"].as_str().unwrap_or("");
+                    let custom_name = parsed["name"].as_str().filter(|s| !s.is_empty());
                     if source.is_empty() {
                         return error_json("Missing 'source'", 400);
                     }
 
-                    let db2 = db.clone();
+                    let job_id = format!("{:x}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos());
+
+                    {
+                        let mut jobs = job_registry.lock().unwrap();
+                        jobs.insert(job_id.clone(), LoadJob {
+                            logs: vec!["Starting image load...".into()],
+                            status: "running".into(),
+                            result: String::new(),
+                        });
+                    }
+
                     let source = source.to_string();
-                    match handle.block_on(async move { image::load_image(db2.as_ref(), &source).await }) {
-                        Ok(name) => tiny_http::Response::from_string(format!("Image {} loaded successfully", name)),
-                        Err(e) => error_json(&format!("{:#}", e), 500),
+                    let custom_name = custom_name.map(|s| s.to_string());
+                    let db = db.clone();
+                    let jobs = job_registry.clone();
+                    let jid = job_id.clone();
+
+                    handle.spawn(async move {
+                        let mut log_line = |line: &str| {
+                            if let Ok(mut j) = jobs.lock() {
+                                if let Some(job) = j.get_mut(&jid) {
+                                    job.logs.push(line.to_string());
+                                }
+                            }
+                        };
+
+                        log_line(&format!("Pulling: {}", source));
+
+                        // For docker_hub: stream docker pull
+                        let is_docker = !(source.starts_with("http") || source.ends_with(".git"));
+                        if is_docker {
+                            match tokio::process::Command::new("docker")
+                                .args(["pull", &source])
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
+                            {
+                                Ok(mut child) => {
+                                    if let Some(stderr) = child.stderr.take() {
+                                        let reader = BufReader::new(stderr);
+                                        let mut lines = reader.lines();
+                                        while let Ok(Some(line)) = lines.next_line().await {
+                                            let trimmed = line.trim().to_string();
+                                            if !trimmed.is_empty() {
+                                                log_line(&trimmed);
+                                            }
+                                        }
+                                    }
+                                    let status = child.wait().await;
+                                    match status {
+                                        Ok(s) if s.success() => log_line("Pull complete"),
+                                        Ok(s) => log_line(&format!("Pull failed with code: {}", s.code().unwrap_or(-1))),
+                                        Err(e) => log_line(&format!("Pull error: {}", e)),
+                                    }
+                                }
+                                Err(e) => {
+                                    log_line(&format!("Failed to start docker: {}", e));
+                                    if let Ok(mut j) = jobs.lock() {
+                                        if let Some(job) = j.get_mut(&jid) {
+                                            job.status = "error".into();
+                                            job.result = format!("{}", e);
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Run image::load_image for inspect + DB insert
+                        match image::load_image(db.as_ref(), &source, custom_name.as_deref()).await {
+                            Ok(name) => {
+                                if let Ok(mut j) = jobs.lock() {
+                                    if let Some(job) = j.get_mut(&jid) {
+                                        job.status = "done".into();
+                                        job.result = format!("Image {} loaded successfully", name);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log_line(&format!("{:#}", e));
+                                if let Ok(mut j) = jobs.lock() {
+                                    if let Some(job) = j.get_mut(&jid) {
+                                        job.status = "error".into();
+                                        job.result = format!("{:#}", e);
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    respond_json(&json!({"job_id": job_id}))
+                }
+
+                (&tiny_http::Method::Get, p) if p.starts_with("/api/image/load/progress") => {
+                    let job_id = raw_path.split('?').nth(1).and_then(|qs| {
+                        qs.split('&').find_map(|pair| {
+                            let mut kv = pair.splitn(2, '=');
+                            if kv.next()? == "job" { kv.next().map(|s| s.to_string()) } else { None }
+                        })
+                    }).unwrap_or_default();
+
+                    let jobs = job_registry.lock().unwrap();
+                    match jobs.get(&job_id) {
+                        Some(job) => respond_json(&json!({
+                            "status": job.status,
+                            "logs": job.logs,
+                            "result": job.result,
+                        })),
+                        None => error_json("Job not found", 404),
                     }
                 }
 
@@ -437,7 +577,6 @@ fn search_docker_hub(query: &str) -> Result<Vec<serde_json::Value>> {
         .iter()
         .filter_map(|r| {
             let name = r["repo_name"].as_str()?;
-            if name.contains('/') { return None; }
             Some(json!({
                 "name": name,
                 "description": r["short_description"].as_str().unwrap_or(""),
@@ -465,4 +604,49 @@ fn urlencoding(s: &str) -> String {
         }
     }
     result
+}
+
+fn fetch_tags(repo: &str, page: u32) -> Result<serde_json::Value> {
+    let tags_url = if repo.contains('/') {
+        format!(
+            "https://hub.docker.com/v2/repositories/{}/tags/?page={}&page_size=20",
+            repo, page
+        )
+    } else {
+        format!(
+            "https://hub.docker.com/v2/repositories/library/{}/tags/?page={}&page_size=20",
+            repo, page
+        )
+    };
+
+    let resp: ureq::Response = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(5))
+        .build()
+        .get(&tags_url)
+        .set("User-Agent", "kdct/0.1")
+        .set("Accept", "application/json")
+        .call()
+        .map_err(|e| anyhow::anyhow!("Docker Hub request failed: {}", e))?;
+
+    let body = resp
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("Invalid response: {}", e))?;
+
+    let tags: Vec<String> = parsed["results"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let has_next = parsed["next"].is_string();
+
+    Ok(json!({
+        "tags": tags,
+        "has_next": has_next,
+    }))
 }

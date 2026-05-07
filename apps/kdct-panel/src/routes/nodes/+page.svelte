@@ -43,7 +43,7 @@
 {/if}
 
 {#if nodes.length === 0}
-  <div class="empty">No nodes registered. Start a client with <code>kdctc --config client.toml</code></div>
+  <div class="empty">No nodes registered. Launch a KDCT client on your target machines.</div>
 {:else}
   <table>
     <thead><tr>
