@@ -19,9 +19,6 @@
   let addingEnv = $state(false);
   let envMsg = $state('');
 
-  let showDeploy = $state(false);
-  let deployNodeId = $state(0);
-
   const dispatch = createEventDispatcher();
 
   async function addPort() {
@@ -70,18 +67,6 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });
-      dispatch('refresh');
-    } catch {}
-  }
-
-  async function doDeploy() {
-    if (!deployNodeId) return;
-    try {
-      await fetch(`/api/bridges/${bridgeId}/deploy`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ node_id: deployNodeId }),
-      });
-      showDeploy = false;
       dispatch('refresh');
     } catch {}
   }
@@ -151,26 +136,6 @@
     <button class="ghost small" onclick={() => { addingEnv = true; envKey = ''; envVal = ''; envMsg = ''; }}>+ Add Env</button>
   {/if}
 
-  <!-- Deploy -->
-  {#if detail?.deployable}
-    <div class="section-head" style="margin-bottom:8px;margin-top:16px"><h3>Deploy</h3></div>
-    {#if onlineNodes.length > 0}
-      {#if showDeploy}
-        <select bind:value={deployNodeId} style="font-size:11px;padding:4px;margin-bottom:8px">
-          <option value={0}>Select node...</option>
-          {#each onlineNodes as n}
-            <option value={n.id}>{n.hostname} ({n.os}, {n.cpu_cores} cores, {n.memory_mb}MB)</option>
-          {/each}
-        </select>
-        <button class="primary small" onclick={doDeploy} disabled={!deployNodeId}>Deploy</button>
-        <button class="ghost small" onclick={() => showDeploy = false}>Cancel</button>
-      {:else}
-        <button class="primary small" onclick={() => showDeploy = true}>Deploy</button>
-      {/if}
-    {:else}
-      <span class="dim" style="font-size:11px">No online nodes</span>
-    {/if}
-  {:else if detail?.ports?.length > 0}
-    <div class="dim" style="margin-top:8px;color:var(--amber);font-size:11px">{detail.deploy_error || 'Not deployable'}</div>
-  {/if}
+  <!-- Deploy info removed — connections handle deployment -->
 </div>
+

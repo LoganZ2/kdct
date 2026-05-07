@@ -7,12 +7,12 @@
   let images: any[] = $state([]);
   let nodes: any[] = $state([]);
   let bridges: any[] = $state([]);
+  let connections: any[] = $state([]);
   let err = $state('');
 
   let showLoad = $state(false);
   let showNewBridge = $state(false);
   let newBridgeName = $state('');
-  let newBridgeImage = $state('');
 
   let expandedBridge = $state<number | null>(null);
   let bridgeDetail = $state<any>(null);
@@ -21,20 +21,25 @@
 
   async function refresh() {
     try {
-      const [ov, im, nd, br] = await Promise.all([
+      const [ov, im, nd, br, cn] = await Promise.all([
         fetch('/api/overview').then(r => r.json()),
         fetch('/api/images').then(r => r.json()),
         fetch('/api/nodes').then(r => r.json()),
         fetch('/api/bridges').then(r => r.json()),
+        fetch('/api/connections').then(r => r.json()),
       ]);
-      overview = ov; images = im; nodes = nd; bridges = br; err = '';
+      overview = ov; images = im; nodes = nd; bridges = br; connections = cn; err = '';
       if (expandedBridge) refreshBridgeDetail(expandedBridge);
-    } catch { err = 'Cannot reach kdcts server'; }
+    } catch { err = 'Cannot reach kdct server'; }
+  }
+
+  async function autoCheck() {
+    try { await fetch('/api/auto-check', { method: 'POST' }); } catch {}
+    refresh();
   }
 
   async function refreshBridgeDetail(id: number) {
-    try { bridgeDetail = await fetch(`/api/bridges/${id}`).then(r => r.json()); }
-    catch { bridgeDetail = null; }
+    try { bridgeDetail = await fetch(`/api/bridges/${id}`).then(r => r.json()); } catch { bridgeDetail = null; }
   }
 
   function toggleBridge(id: number) {
@@ -42,17 +47,15 @@
     expandedBridge = id; bridgeDetail = null; refreshBridgeDetail(id);
   }
 
-  onMount(() => { refresh(); timer = setInterval(refresh, 5000); });
+  onMount(() => { refresh(); timer = setInterval(autoCheck, 5000); });
   onDestroy(() => { if (timer) clearInterval(timer); });
 
   function mem(mb: number) { return mb >= 1024 ? `${(mb/1024).toFixed(1)} GB` : `${mb} MB`; }
   function dk(v: string) { return v ? v.split('.').slice(0,2).join('.') : '—'; }
   function ago(ts: number) {
     const s = Math.floor(Date.now()/1000 - ts);
-    if (s < 60) return 'just now';
-    if (s < 3600) return `${Math.floor(s/60)}m ago`;
-    if (s < 86400) return `${Math.floor(s/3600)}h ago`;
-    return `${Math.floor(s/86400)}d ago`;
+    if (s < 60) return 'just now'; if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    if (s < 86400) return `${Math.floor(s/3600)}h ago`; return `${Math.floor(s/86400)}d ago`;
   }
 
   async function deleteBridge(id: number) {
@@ -62,21 +65,32 @@
     refresh();
   }
 
-  async function doStop(bridgeId: number) {
-    try { await fetch(`/api/bridges/${bridgeId}/stop`, { method: 'POST' }); refresh(); }
-    catch {}
+  async function createBridge() {
+    if (!newBridgeName) return;
+    try {
+      await fetch('/api/bridges', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newBridgeName }) });
+      showNewBridge = false; newBridgeName = ''; refresh();
+    } catch {}
   }
 
-  async function createBridge() {
-    if (!newBridgeName || !newBridgeImage) return;
+  async function createConnection() {
     try {
-      await fetch('/api/bridges', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newBridgeName, image: newBridgeImage }),
-      });
-      showNewBridge = false; newBridgeName = ''; newBridgeImage = '';
+      await fetch('/api/connections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'connection' }) });
       refresh();
     } catch {}
+  }
+
+  async function deleteConnection(id: number) {
+    if (!confirm('Delete this connection?')) return;
+    await fetch(`/api/connections/${id}`, { method: 'DELETE' });
+    refresh();
+  }
+
+  async function updateConnection(id: number, field: string, value: number | null) {
+    const body: any = {};
+    body[field] = value;
+    await fetch(`/api/connections/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    refresh();
   }
 
   const online = $derived(nodes.filter((n: any) => n.status === 'online'));
@@ -87,90 +101,81 @@
 {/if}
 
 <div class="page">
-  <!-- Stats -->
   {#if overview}
   <div class="stats">
-    <div class="stat">
-      <div class="stat-v">{overview.online_count}<span style="color:var(--text-dim);font-weight:400">/{overview.node_count}</span></div>
-      <div class="stat-l">Nodes online</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.image_count}</div>
-      <div class="stat-l">Images</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.bridge_count ?? 0}</div>
-      <div class="stat-l">Bridges</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.deployed_count ?? 0}</div>
-      <div class="stat-l">Deployed</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.container_count}</div>
-      <div class="stat-l">Containers</div>
-    </div>
-    <div class="stat">
-      <div class="stat-v">{overview.pool_free ?? '-'}/{overview.pool_total ?? '-'}</div>
-      <div class="stat-l">Ports free</div>
-    </div>
+    <div class="stat"><div class="stat-v">{overview.online_count}<span style="color:var(--text-dim);font-weight:400">/{overview.node_count}</span></div><div class="stat-l">Nodes online</div></div>
+    <div class="stat"><div class="stat-v">{overview.image_count}</div><div class="stat-l">Images</div></div>
+    <div class="stat"><div class="stat-v">{overview.bridge_count ?? 0}</div><div class="stat-l">Bridges</div></div>
+    <div class="stat"><div class="stat-v">{overview.connection_count ?? 0}</div><div class="stat-l">Connections</div></div>
+    <div class="stat"><div class="stat-v">{overview.deployed_count ?? 0}</div><div class="stat-l">Deployed</div></div>
+    <div class="stat"><div class="stat-v">{overview.container_count}</div><div class="stat-l">Containers</div></div>
+    <div class="stat"><div class="stat-v">{overview.pool_free ?? '-'}/{overview.pool_total ?? '-'}</div><div class="stat-l">Ports free</div></div>
   </div>
   {/if}
 
-  <!-- Images -->
+  <!-- Connections -->
   <div class="section">
-    <div class="section-head">
-      <h2>Images</h2>
-      <button class="primary" style="font-size:11px;padding:4px 10px" onclick={() => showLoad = true}>+ Load Image</button>
-    </div>
+    <div class="section-head"><h2>Connections</h2><button class="primary" style="font-size:11px;padding:4px 10px" onclick={createConnection}>+ New Connection</button></div>
+    {#if connections.length === 0}
+      <div class="dim" style="text-align:center;padding:32px">No connections yet. Create a connection, assign a Bridge, Image, and Node — it will auto-start when all three are ready.</div>
+    {:else}
     <table>
-      <thead><tr><th>Name</th><th>Source</th><th>Type</th><th>Status</th><th class="actions">Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Bridge</th><th>Image</th><th>Node</th><th>Status</th><th class="actions"></th></tr></thead>
       <tbody>
-        {#each images as img}
+        {#each connections as c}
           <tr>
-            <td class="hi">{img.name}</td>
-            <td class="dim">{img.source}</td>
-            <td class="dim">{img.source_type}</td>
-            <td><span class="badge loaded">{img.status}</span></td>
-            <td class="actions">
-              <button class="ghost small" onclick={() => { newBridgeImage = img.name; newBridgeName = img.name.replace(/[/:]/g, '-'); showNewBridge = true; }}>Create Bridge</button>
+            <td class="hi">{c.name} <span class="dim" style="font-size:10px">#{c.id}</span></td>
+            <td>
+              <select class="slot-select" value={c.bridge_id ?? ''} onchange={(e) => { const v = e.currentTarget.value; updateConnection(c.id, 'bridge_id', v ? parseInt(v) : null); }}>
+                <option value="">—</option>
+                {#each bridges as b}
+                  <option value={b.id} selected={c.bridge_id === b.id}>{b.name}</option>
+                {/each}
+              </select>
             </td>
+            <td>
+              <select class="slot-select" value={c.image_id ?? ''} onchange={(e) => { const v = e.currentTarget.value; updateConnection(c.id, 'image_id', v ? parseInt(v) : null); }}>
+                <option value="">—</option>
+                {#each images as i}
+                  <option value={i.id} selected={c.image_id === i.id}>{i.name}</option>
+                {/each}
+              </select>
+            </td>
+            <td>
+              <select class="slot-select" value={c.node_id ?? ''} onchange={(e) => { const v = e.currentTarget.value; updateConnection(c.id, 'node_id', v ? parseInt(v) : null); }}>
+                <option value="">—</option>
+                {#each online as n}
+                  <option value={n.id} selected={c.node_id === n.id}>{n.hostname}</option>
+                {/each}
+              </select>
+            </td>
+            <td><span class="badge {c.status}">{c.status}</span></td>
+            <td class="actions"><button class="ghost small danger" onclick={() => deleteConnection(c.id)}>×</button></td>
           </tr>
-        {:else}
-          <tr><td colspan="5" class="dim" style="text-align:center;padding:32px">No images loaded. Click <em>+ Load Image</em> to pull from Docker Hub.</td></tr>
         {/each}
       </tbody>
     </table>
+    {/if}
   </div>
 
   <!-- Bridges -->
   <div class="section">
-    <div class="section-head"><h2>Bridges</h2></div>
+    <div class="section-head"><h2>Bridges</h2><button class="ghost small" onclick={() => showNewBridge = true}>+ New Bridge</button></div>
     {#if bridges.length === 0}
-      <div class="dim" style="text-align:center;padding:32px">No bridges yet. Load an image, then create a bridge to configure ports and deploy.</div>
+      <div class="dim" style="text-align:center;padding:20px">No bridges yet. Bridges are port configuration templates.</div>
     {:else}
     <table>
-      <thead><tr><th>Name</th><th>Image</th><th>Status</th><th>Node</th><th class="actions">Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Status</th><th class="actions">Actions</th></tr></thead>
       <tbody>
         {#each bridges as br}
-          {@const deployed = br.status === 'deployed'}
           <tr>
             <td class="hi"><button class="ghost small mono" onclick={() => toggleBridge(br.id)}>{br.name}</button></td>
-            <td class="dim">{br.image_name}</td>
-            <td><span class="badge {br.status}">{br.status}</span></td>
-            <td class="dim">{br.node_id ?? '-'}</td>
-            <td class="actions">
-              {#if deployed}
-                <button class="ghost small danger" onclick={() => doStop(br.id)}>Stop</button>
-              {:else}
-                <button class="ghost small" onclick={() => toggleBridge(br.id)}>Configure</button>
-              {/if}
-              <button class="ghost small danger" onclick={() => deleteBridge(br.id)} style="margin-left:4px">×</button>
-            </td>
+            <td><span class="badge loaded">{br.status}</span></td>
+            <td class="actions"><button class="ghost small danger" onclick={() => deleteBridge(br.id)}>×</button></td>
           </tr>
-          {#if expandedBridge === br.id}
-            <tr><td colspan="5">
-              <BridgeDetail bridgeId={br.id} {bridgeDetail} onlineNodes={online} onrefresh={() => refreshBridgeDetail(br.id)} />
+          {#if expandedBridge === br.id && bridgeDetail}
+            <tr><td colspan="3">
+              <BridgeDetail bridgeId={br.id} {bridgeDetail} {onlineNodes} onrefresh={() => refreshBridgeDetail(br.id)} />
             </td></tr>
           {/if}
         {/each}
@@ -179,28 +184,36 @@
     {/if}
   </div>
 
+  <!-- Images -->
+  <div class="section">
+    <div class="section-head"><h2>Images</h2><button class="primary" style="font-size:11px;padding:4px 10px" onclick={() => showLoad = true}>+ Load Image</button></div>
+    <table>
+      <thead><tr><th>Name</th><th>Source</th><th>Type</th><th>Status</th></tr></thead>
+      <tbody>
+        {#each images as img}
+          <tr><td class="hi">{img.name}</td><td class="dim">{img.source}</td><td class="dim">{img.source_type}</td><td><span class="badge loaded">{img.status}</span></td></tr>
+        {:else}
+          <tr><td colspan="4" class="dim" style="text-align:center;padding:20px">No images loaded. Click <em>+ Load Image</em> to pull from Docker Hub.</td></tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+
   <!-- Nodes -->
   <div class="section">
-    <div class="section-head">
-      <h2>Nodes</h2>
-      <span class="dim">{online.length} online</span>
-    </div>
+    <div class="section-head"><h2>Nodes</h2><span class="dim">{online.length} online</span></div>
     <table>
       <thead><tr><th>Hostname</th><th>OS</th><th>Docker</th><th>CPU</th><th>Memory</th><th>Port Range</th><th>Status</th><th>Last Seen</th></tr></thead>
       <tbody>
         {#each nodes as n}
           <tr>
-            <td class="hi">{n.hostname}</td>
-            <td class="dim">{n.os} {n.arch}</td>
-            <td class="dim">{dk(n.docker_version)}</td>
-            <td class="dim">{n.cpu_cores} cores</td>
-            <td class="dim">{mem(n.memory_mb)}</td>
+            <td class="hi">{n.hostname}</td><td class="dim">{n.os} {n.arch}</td><td class="dim">{dk(n.docker_version)}</td>
+            <td class="dim">{n.cpu_cores} cores</td><td class="dim">{mem(n.memory_mb)}</td>
             <td class="dim">{n.port_range_start}–{n.port_range_end}</td>
-            <td><span class="badge {n.status}">{n.status}</span></td>
-            <td class="dim">{ago(n.last_seen)}</td>
+            <td><span class="badge {n.status}">{n.status}</span></td><td class="dim">{ago(n.last_seen)}</td>
           </tr>
         {:else}
-          <tr><td colspan="8" class="dim" style="text-align:center;padding:32px">No nodes connected. Start a kdct client node on another machine.</td></tr>
+          <tr><td colspan="8" class="dim" style="text-align:center;padding:20px">No nodes connected.</td></tr>
         {/each}
       </tbody>
     </table>
@@ -208,17 +221,37 @@
 
   <!-- New Bridge Modal -->
   {#if showNewBridge}
-  <div class="modal-overlay" onclick={() => showNewBridge = false}></div>
-  <div class="modal">
-    <h2>New Bridge</h2>
-    <button class="ghost small" style="position:absolute;top:8px;right:8px" onclick={() => showNewBridge = false}>×</button>
-    <div style="margin-top:8px">
-      <input bind:value={newBridgeName} placeholder="Bridge name" />
-      <input bind:value={newBridgeImage} placeholder="Image name" style="margin-top:8px" disabled />
-      <button class="primary small" style="margin-top:12px" onclick={createBridge}>Create</button>
+  <div class="overlay" onclick={() => showNewBridge = false} onkeydown={(e) => { if (e.key === 'Escape') showNewBridge = false; }}>
+    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+      <div class="modal-head"><span>New <em>Bridge</em></span><button class="ghost" onclick={() => showNewBridge = false}>Close</button></div>
+      <div class="field"><input bind:value={newBridgeName} placeholder="Bridge name" /></div>
+      <button class="primary" onclick={createBridge} disabled={!newBridgeName.trim()}>Create</button>
     </div>
   </div>
   {/if}
 
   <LoadImageModal bind:show={showLoad} onloaded={refresh} />
 </div>
+
+<style>
+  .page { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; display: flex; flex-direction: column; gap: 2px; }
+  .stat-v { font-size: 20px; font-weight: 700; color: var(--text-hi); }
+  .stat-l { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
+  .section { margin-bottom: 32px; }
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .section-head h2 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: var(--radius); font-weight: 600; }
+  .badge.loaded, .badge.draft { background: var(--surface2); color: var(--text); }
+  .badge.online { background: #064e3b; color: #34d399; }
+  .badge.offline { background: var(--surface2); color: var(--text-dim); }
+  .badge.pending { background: #4a2e00; color: #fbbf24; }
+  .badge.deployed { background: #1e3a5f; color: #60a5fa; }
+  .badge.direct { background: #4a1e5f; color: #c084fc; }
+  .badge.route { background: #1e3a5f; color: #60a5fa; }
+  .actions { text-align: right; white-space: nowrap; }
+  .slot-select { font-family: var(--mono); font-size: 11px; background: var(--bg); border: 1px solid var(--border2); color: var(--text-hi); padding: 4px 6px; border-radius: var(--radius); min-width: 100px; }
+  .danger { color: var(--red) !important; }
+  .small { font-size: 10px !important; padding: 3px 10px !important; }
+</style>

@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection as SqlConnection, params};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::info;
 
 pub struct Database {
-    conn: Mutex<Connection>,
+    conn: Mutex<SqlConnection>,
     path: String,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ImageNode {
     pub id: i64,
     pub name: String,
@@ -31,7 +30,6 @@ pub struct BridgePort {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ClientNode {
     pub id: i64,
     pub hostname: String,
@@ -49,7 +47,7 @@ pub struct ClientNode {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).context("Failed to open database")?;
+        let conn = SqlConnection::open(path).context("Failed to open database")?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
             .context("Failed to set PRAGMA")?;
         let db = Database {
@@ -59,10 +57,6 @@ impl Database {
         db.migrate()?;
         info!("Database opened at {}", path.display());
         Ok(db)
-    }
-
-    pub fn clone_for_connection(&self) -> Result<Self> {
-        Database::open(&PathBuf::from(&self.path))
     }
 
     fn migrate(&self) -> Result<()> {
@@ -81,11 +75,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS bridges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
-                image_node_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'draft',
-                node_id INTEGER,
-                FOREIGN KEY (image_node_id) REFERENCES image_nodes(id) ON DELETE CASCADE,
-                FOREIGN KEY (node_id) REFERENCES client_nodes(id) ON DELETE SET NULL
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
             CREATE TABLE IF NOT EXISTS bridge_ports (
@@ -105,6 +96,20 @@ impl Database {
                 value TEXT NOT NULL,
                 FOREIGN KEY (bridge_id) REFERENCES bridges(id) ON DELETE CASCADE,
                 UNIQUE(bridge_id, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                bridge_id INTEGER,
+                image_id INTEGER,
+                node_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                container_name TEXT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                FOREIGN KEY (bridge_id) REFERENCES bridges(id) ON DELETE SET NULL,
+                FOREIGN KEY (image_id) REFERENCES image_nodes(id) ON DELETE SET NULL,
+                FOREIGN KEY (node_id) REFERENCES client_nodes(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS client_nodes (
@@ -127,7 +132,7 @@ impl Database {
         Ok(())
     }
 
-    // ── Image operations ──────────────────────────────────────
+    // ── Image ─────────────────────────────────────────────────
 
     pub fn insert_image(&self, name: &str, source: &str, source_type: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -138,18 +143,30 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn update_image_status(&self, id: i64, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE image_nodes SET status=?1 WHERE id=?2", params![status, id])?;
-        Ok(())
-    }
-
     pub fn get_image_by_name(&self, name: &str) -> Result<Option<ImageNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, name, source, source_type, status, created_at FROM image_nodes WHERE name=?1",
         )?;
         let mut rows = stmt.query_map(params![name], |row| {
+            Ok(ImageNode {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                source: row.get(2)?,
+                source_type: row.get(3)?,
+                status: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn get_image_by_id(&self, id: i64) -> Result<Option<ImageNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, source, source_type, status, created_at FROM image_nodes WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
             Ok(ImageNode {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -180,13 +197,13 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    // ── Bridge operations ─────────────────────────────────────
+    // ── Bridge (independent template) ─────────────────────────
 
-    pub fn insert_bridge(&self, name: &str, image_node_id: i64) -> Result<i64> {
+    pub fn insert_bridge(&self, name: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO bridges (name, image_node_id, status) VALUES (?1, ?2, 'draft')",
-            params![name, image_node_id],
+            "INSERT INTO bridges (name, status) VALUES (?1, 'draft')",
+            params![name],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -194,17 +211,14 @@ impl Database {
     pub fn list_bridges(&self) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT b.id, b.name, b.image_node_id, b.status, b.node_id, i.name as image_name \
-             FROM bridges b JOIN image_nodes i ON b.image_node_id = i.id ORDER BY b.id DESC",
+            "SELECT id, name, status, created_at FROM bridges ORDER BY id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, i64>(0)?,
                 "name": row.get::<_, String>(1)?,
-                "image_node_id": row.get::<_, i64>(2)?,
-                "status": row.get::<_, String>(3)?,
-                "node_id": row.get::<_, Option<i64>>(4)?,
-                "image_name": row.get::<_, String>(5)?,
+                "status": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
             }))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
@@ -213,17 +227,14 @@ impl Database {
     pub fn get_bridge_by_id(&self, bridge_id: i64) -> Result<Option<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT b.id, b.name, b.image_node_id, b.status, b.node_id, i.name as image_name \
-             FROM bridges b JOIN image_nodes i ON b.image_node_id = i.id WHERE b.id=?1",
+            "SELECT id, name, status, created_at FROM bridges WHERE id=?1",
         )?;
         let mut rows = stmt.query_map(params![bridge_id], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, i64>(0)?,
                 "name": row.get::<_, String>(1)?,
-                "image_node_id": row.get::<_, i64>(2)?,
-                "status": row.get::<_, String>(3)?,
-                "node_id": row.get::<_, Option<i64>>(4)?,
-                "image_name": row.get::<_, String>(5)?,
+                "status": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
             }))
         })?;
         match rows.next() {
@@ -236,30 +247,6 @@ impl Database {
     pub fn delete_bridge(&self, bridge_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM bridges WHERE id=?1", params![bridge_id])?;
-        Ok(())
-    }
-
-    pub fn update_bridge_status(&self, bridge_id: i64, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE bridges SET status=?1 WHERE id=?2", params![status, bridge_id])?;
-        Ok(())
-    }
-
-    pub fn update_bridge_node(&self, bridge_id: i64, node_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE bridges SET node_id=?1, status='deployed' WHERE id=?2",
-            params![node_id, bridge_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn clear_bridge_node(&self, bridge_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE bridges SET node_id=NULL, status='draft' WHERE id=?1",
-            params![bridge_id],
-        )?;
         Ok(())
     }
 
@@ -326,7 +313,146 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    // ── Node operations ───────────────────────────────────────
+    // ── Connections ───────────────────────────────────────────
+
+    pub fn insert_connection(&self, name: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO connections (name, status) VALUES (?1, 'pending')",
+            params![name],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_connection(&self, connection_id: i64, bridge_id: Option<i64>, image_id: Option<i64>, node_id: Option<i64>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut current_bridge = None;
+        let mut current_image = None;
+        let mut current_node = None;
+        {
+            let mut stmt = conn.prepare("SELECT bridge_id, image_id, node_id FROM connections WHERE id=?1")?;
+            let mut rows = stmt.query_map(params![connection_id], |row| {
+                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?))
+            })?;
+            if let Some(Ok((b, i, n))) = rows.next() {
+                current_bridge = b;
+                current_image = i;
+                current_node = n;
+            }
+        }
+        let final_bridge = bridge_id.or(current_bridge);
+        let final_image = image_id.or(current_image);
+        let final_node = node_id.or(current_node);
+        conn.execute(
+            "UPDATE connections SET bridge_id=?1, image_id=?2, node_id=?3 WHERE id=?4",
+            params![final_bridge, final_image, final_node, connection_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_connection_node(&self, connection_id: i64, node_id: Option<i64>, status: &str, container_name: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET node_id=?1, status=?2, container_name=?3 WHERE id=?4",
+            params![node_id, status, container_name, connection_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_connections(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.name, c.bridge_id, c.image_id, c.node_id, c.status, c.container_name, c.created_at, \
+             b.name as bridge_name, i.name as image_name, n.hostname as node_hostname \
+             FROM connections c \
+             LEFT JOIN bridges b ON c.bridge_id = b.id \
+             LEFT JOIN image_nodes i ON c.image_id = i.id \
+             LEFT JOIN client_nodes n ON c.node_id = n.id \
+             ORDER BY c.created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "bridge_id": row.get::<_, Option<i64>>(2)?,
+                "image_id": row.get::<_, Option<i64>>(3)?,
+                "node_id": row.get::<_, Option<i64>>(4)?,
+                "status": row.get::<_, String>(5)?,
+                "container_name": row.get::<_, Option<String>>(6)?,
+                "created_at": row.get::<_, i64>(7)?,
+                "bridge_name": row.get::<_, Option<String>>(8)?,
+                "image_name": row.get::<_, Option<String>>(9)?,
+                "node_hostname": row.get::<_, Option<String>>(10)?,
+            }))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_connection(&self, id: i64) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.name, c.bridge_id, c.image_id, c.node_id, c.status, c.container_name, c.created_at, \
+             b.name as bridge_name, i.name as image_name, n.hostname as node_hostname, n.status as node_status \
+             FROM connections c \
+             LEFT JOIN bridges b ON c.bridge_id = b.id \
+             LEFT JOIN image_nodes i ON c.image_id = i.id \
+             LEFT JOIN client_nodes n ON c.node_id = n.id \
+             WHERE c.id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "bridge_id": row.get::<_, Option<i64>>(2)?,
+                "image_id": row.get::<_, Option<i64>>(3)?,
+                "node_id": row.get::<_, Option<i64>>(4)?,
+                "status": row.get::<_, String>(5)?,
+                "container_name": row.get::<_, Option<String>>(6)?,
+                "created_at": row.get::<_, i64>(7)?,
+                "bridge_name": row.get::<_, Option<String>>(8)?,
+                "image_name": row.get::<_, Option<String>>(9)?,
+                "node_hostname": row.get::<_, Option<String>>(10)?,
+                "node_status": row.get::<_, Option<String>>(11)?,
+            }))
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_connection(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM connections WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Get all connections that are ready to deploy (all three set + node online)
+    pub fn get_connectable_connections(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id FROM connections c \
+             JOIN client_nodes n ON c.node_id = n.id \
+             WHERE c.bridge_id IS NOT NULL AND c.image_id IS NOT NULL AND c.node_id IS NOT NULL \
+             AND n.status = 'online' AND c.status = 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({ "id": row.get::<_, i64>(0)? }))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_connection_ids_for_node(&self, node_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM connections WHERE node_id=?1 AND status='deployed'",
+        )?;
+        let rows = stmt.query_map(params![node_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // ── Nodes ─────────────────────────────────────────────────
 
     pub fn upsert_node(
         &self,
@@ -393,5 +519,30 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE client_nodes SET status='offline'", [])?;
         Ok(())
+    }
+
+    pub fn get_node_by_id(&self, id: i64) -> Result<Option<ClientNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, hostname, os, arch, docker_version, port_range_start, port_range_end, \
+             cpu_cores, memory_mb, status, auth_digest, last_seen FROM client_nodes WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(ClientNode {
+                id: row.get(0)?,
+                hostname: row.get(1)?,
+                os: row.get(2)?,
+                arch: row.get(3)?,
+                docker_version: row.get(4)?,
+                port_range_start: row.get(5)?,
+                port_range_end: row.get(6)?,
+                cpu_cores: row.get(7)?,
+                memory_mb: row.get(8)?,
+                status: row.get(9)?,
+                auth_digest: row.get(10)?,
+                last_seen: row.get(11)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 }

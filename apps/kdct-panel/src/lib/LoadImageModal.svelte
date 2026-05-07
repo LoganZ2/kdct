@@ -137,7 +137,7 @@
 
 {#if show}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="modal-overlay" onclick={close} onkeydown={(e) => { if (e.key === 'Escape') close(); }}>
+  <div class="overlay" onclick={close} onkeydown={(e) => { if (e.key === 'Escape') close(); }}>
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <div class="modal-head">
@@ -206,7 +206,7 @@
 <!-- Manual entry modal -->
 {#if showManual}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="modal-overlay" onclick={() => showManual = false} onkeydown={(e) => { if (e.key === 'Escape') showManual = false; }}>
+  <div class="overlay" onclick={() => showManual = false} onkeydown={(e) => { if (e.key === 'Escape') showManual = false; }}>
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="modal" style="z-index:200" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <div class="modal-head">

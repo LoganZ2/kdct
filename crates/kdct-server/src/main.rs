@@ -133,11 +133,23 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                                     cpu_cores as i64,
                                     memory_mb as i64,
                                 );
+                                // Node goes online — auto-check will be done by frontend polling
                             }
                         }
                         NodeEvent::Disconnected { hostname: _ } => {
                             if let Ok(d) = Database::open(&sync_db_path) {
-                                let _ = d.set_node_offline(&update.digest);
+                                // Mark connections as pending for this node
+                                d.set_node_offline(&update.digest);
+                                // Find node_id from digest
+                                if let Ok(nodes) = d.list_nodes() {
+                                    if let Some(node) = nodes.iter().find(|n| n.auth_digest.as_deref() == Some(&update.digest)) {
+                                        if let Ok(conn_ids) = d.get_connection_ids_for_node(node.id) {
+                                            for cid in conn_ids {
+                                                let _ = d.update_connection_node(cid, Some(node.id), "pending", None);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             crate::deployment_tracker::remove_by_node(
                                 &sync_tracker,

@@ -11,37 +11,34 @@ use crate::db::Database;
 use crate::deployment_tracker::DeploymentTracker;
 use crate::proxy::RouteTable;
 
-pub async fn deploy_bridge(
+pub async fn deploy_connection(
     db: &Database,
     registry: &ClientRegistry,
     route_table: &Arc<RwLock<RouteTable>>,
     pool: &Arc<tunnel::port_pool::PortPool>,
     tracker: &DeploymentTracker,
-    bridge_id: i64,
-    target_node_id: i64,
+    connection_id: i64,
     active_forwards: &Arc<RwLock<Vec<(u16, broadcast::Sender<bool>)>>>,
 ) -> Result<String> {
-    let bridge = db.get_bridge_by_id(bridge_id)?
-        .context("Bridge not found")?;
+    let conn_info = db.get_connection(connection_id)?
+        .context("Connection not found")?;
 
-    let bridge_name = bridge["name"].as_str().unwrap_or("").to_string();
-    let image_node_id = bridge["image_node_id"].as_i64().unwrap_or(0);
-    let image_name = bridge["image_name"].as_str().unwrap_or("").to_string();
+    let bridge_id = conn_info["bridge_id"].as_i64().context("Bridge not assigned")?;
+    let image_id = conn_info["image_id"].as_i64().context("Image not assigned")?;
+    let node_id = conn_info["node_id"].as_i64().context("Node not assigned")?;
 
-    if bridge["status"].as_str() != Some("draft") {
-        bail!("Bridge '{}' is not in draft state", bridge_name);
+    let bridge_name = conn_info["bridge_name"].as_str().unwrap_or("").to_string();
+    let image_name = conn_info["image_name"].as_str().unwrap_or("").to_string();
+    let connection_name = conn_info["name"].as_str().unwrap_or("").to_string();
+
+    // Check node is online
+    let node = db.get_node_by_id(node_id)?.context("Node not found")?;
+    if node.status != "online" {
+        bail!("Node '{}' is not online", node.hostname);
     }
 
     let image = db.get_image_by_name(&image_name)?
         .context("Image not found")?;
-
-    let nodes = db.list_nodes()?;
-    let node = nodes.iter().find(|n| n.id == target_node_id)
-        .context(format!("Node {} not found", target_node_id))?;
-
-    if node.status != "online" {
-        bail!("Node '{}' is not online", node.hostname);
-    }
 
     let ports = db.get_bridge_ports(bridge_id)?;
     if ports.is_empty() {
@@ -72,7 +69,7 @@ pub async fn deploy_bridge(
     }
 
     let container_ports: Vec<u16> = ports.iter().map(|p| p.container_port as u16).collect();
-    let mapping = pool.assign(&[image_node_id as u8], &container_ports)
+    let mapping = pool.assign(&[image_id as u8], &container_ports)
         .await
         .context("Failed to assign ports from pool")?;
 
@@ -85,7 +82,7 @@ pub async fn deploy_bridge(
         client_port += 1;
     }
 
-    let container_name = bridge_name.replace(['/', ':'], "-");
+    let container_name = connection_name.replace(['/', ':'], "-");
 
     let (node_digest, cmd_tx, pending_docker, data_ch_req_tx, port_data_callbacks) = {
         let guard = registry.read().await;
@@ -107,7 +104,6 @@ pub async fn deploy_bridge(
                 branch: "main".into(),
                 image_tag: tag.clone(),
             }).await.context("Failed to send DockerBuild command")?;
-            info!("Sent DockerBuild for {} -> {}", image.source, tag);
             tag
         }
         _ => image.source.clone(),
@@ -153,7 +149,7 @@ pub async fn deploy_bridge(
 
     if let Some(digest) = node_digest {
         crate::deployment_tracker::record_deployment(
-            tracker, &bridge_name, &container_name, &digest, server_ports.clone(),
+            tracker, &connection_name, &container_name, &digest, server_ports.clone(),
         ).await;
     }
 
@@ -168,96 +164,89 @@ pub async fn deploy_bridge(
         }
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
         spawn_port_accept_loop(
-            pool.clone(),
-            server_port,
-            port_map[i].0,
-            data_ch_req_tx.clone(),
-            port_data_callbacks.clone(),
-            shutdown_rx,
+            pool.clone(), server_port, port_map[i].0,
+            data_ch_req_tx.clone(), port_data_callbacks.clone(), shutdown_rx,
         );
         active_forwards.write().await.push((server_port, shutdown_tx));
     }
     drop(table);
 
-    db.update_bridge_node(bridge_id, target_node_id)?;
+    db.update_connection_node(connection_id, Some(node_id), "deployed", Some(&container_name))?;
 
-    info!("Deployed bridge '{}' -> '{}' (container={})", bridge_name, node.hostname, container_name);
-    Ok(format!("Deployed '{}' to '{}'. Container: {}", bridge_name, node.hostname, container_name))
+    info!("Deployed connection '{}' -> '{}' (container={})", connection_name, node.hostname, container_name);
+    Ok(format!("Deployed '{}' to '{}'", connection_name, node.hostname))
 }
 
-pub async fn stop_bridge(
+pub async fn stop_connection(
     db: &Database,
     registry: &ClientRegistry,
     route_table: &Arc<RwLock<RouteTable>>,
     pool: &Arc<tunnel::port_pool::PortPool>,
     tracker: &DeploymentTracker,
-    bridge_id: i64,
+    connection_id: i64,
     active_forwards: &Arc<RwLock<Vec<(u16, broadcast::Sender<bool>)>>>,
 ) -> Result<String> {
-    let bridge = db.get_bridge_by_id(bridge_id)?
-        .context("Bridge not found")?;
+    let conn_info = db.get_connection(connection_id)?
+        .context("Connection not found")?;
 
-    let bridge_name = bridge["name"].as_str().unwrap_or("").to_string();
-    let node_id = bridge["node_id"].as_i64().context("Bridge is not deployed")?;
+    let connection_name = conn_info["name"].as_str().unwrap_or("").to_string();
+    let node_id = conn_info["node_id"].as_i64();
+    let container_name = conn_info["container_name"].as_str().unwrap_or(&connection_name).to_string();
 
-    let nodes = db.list_nodes()?;
-    let node = nodes.iter().find(|n| n.id == node_id)
-        .context(format!("Node {} not found", node_id))?;
-
-    let guard = registry.read().await;
-    let node_digest = guard.iter()
-        .find(|(_, v)| v.hostname == node.hostname)
-        .map(|(k, _)| hex::encode(k))
-        .context("Node not connected in registry")?;
-    let entry = guard.values()
-        .find(|e| e.hostname == node.hostname)
-        .context("Node not connected in registry")?;
-    let cmd_tx = entry.cmd_tx.clone();
-    let pending_docker = entry.pending_docker.clone();
-    drop(guard);
-
-    let deployment = crate::deployment_tracker::get_deployment(tracker, &bridge_name, &node_digest)
-        .await
-        .context("Bridge is not deployed on this node")?;
-
-    let container_name = bridge_name.replace(['/', ':'], "-");
-
-    let (tx, rx) = oneshot::channel::<Result<Vec<u16>, String>>();
-    {
-        let mut pending = pending_docker.write().await;
-        pending.insert(container_name.clone(), tx);
+    if conn_info["status"].as_str() != Some("deployed") {
+        bail!("Connection is not deployed");
     }
 
-    cmd_tx.send(ControlChannelCmd::DockerStop {
-        container_name: container_name.clone(),
-    }).await.context("Failed to send DockerStop command")?;
+    // Try to send DockerStop if node is still online
+    if let Some(nid) = node_id {
+        if let Ok(Some(node)) = db.get_node_by_id(nid) {
+            let guard = registry.read().await;
+            let node_digest = guard.iter()
+                .find(|(_, v)| v.hostname == node.hostname)
+                .map(|(k, _)| hex::encode(k));
+            if let Some(entry) = guard.values().find(|e| e.hostname == node.hostname) {
+                let cmd_tx = entry.cmd_tx.clone();
+                let pending_docker = entry.pending_docker.clone();
+                drop(guard);
 
-    let _ = time::timeout(Duration::from_secs(30), rx).await;
-
-    // Remove routes
-    let mut table = route_table.write().await;
-    for port in &deployment.server_ports {
-        table.remove_by_port(*port);
-        pool.release_by_port(*port).await;
-    }
-    drop(table);
-
-    // Stop accept loops
-    {
-        let mut fw = active_forwards.write().await;
-        fw.retain(|(sp, tx)| {
-            if deployment.server_ports.contains(sp) {
-                let _ = tx.send(true);
-                false
-            } else {
-                true
+                let (tx, rx) = oneshot::channel::<Result<Vec<u16>, String>>();
+                {
+                    let mut pending = pending_docker.write().await;
+                    pending.insert(container_name.clone(), tx);
+                }
+                let _ = cmd_tx.send(ControlChannelCmd::DockerStop {
+                    container_name: container_name.clone(),
+                }).await;
+                let _ = time::timeout(Duration::from_secs(30), rx).await;
             }
-        });
+        }
     }
 
-    crate::deployment_tracker::remove_deployment(tracker, &bridge_name, &node_digest).await;
-    db.clear_bridge_node(bridge_id)?;
+    // Clean up routes + pool ports
+    if let Some(digest_hex) = node_id.and_then(|nid| {
+        db.get_node_by_id(nid).ok().flatten().map(|n|
+            hex::encode(n.auth_digest.unwrap_or_default())
+        )
+    }) {
+        if let Some(deployment) = crate::deployment_tracker::get_deployment(tracker, &connection_name, &digest_hex).await {
+            let mut table = route_table.write().await;
+            for port in &deployment.server_ports {
+                table.remove_by_port(*port);
+                pool.release_by_port(*port).await;
+            }
+            drop(table);
 
-    info!("Stopped bridge '{}' on '{}'", bridge_name, node.hostname);
-    Ok(format!("Stopped bridge '{}' on '{}'", bridge_name, node.hostname))
+            let mut fw = active_forwards.write().await;
+            fw.retain(|(sp, tx)| {
+                if deployment.server_ports.contains(sp) { let _ = tx.send(true); false } else { true }
+            });
+
+            crate::deployment_tracker::remove_deployment(tracker, &connection_name, &digest_hex).await;
+        }
+    }
+
+    db.update_connection_node(connection_id, None, "pending", None)?;
+
+    info!("Stopped connection '{}'", connection_name);
+    Ok(format!("Stopped '{}'", connection_name))
 }
