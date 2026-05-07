@@ -47,6 +47,11 @@
     if (s < 86400) return `${Math.floor(s/3600)}h ago`; return `${Math.floor(s/86400)}d ago`;
   }
 
+  function toggleBridge(id: number) {
+    if (expandedBridge === id) { expandedBridge = null; return; }
+    expandedBridge = id;
+  }
+
   async function deleteBridge(id: number) {
     if (!confirm('Delete this bridge?')) return;
     await fetch(`/api/bridges/${id}`, { method: 'DELETE' });
