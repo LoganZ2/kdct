@@ -115,7 +115,7 @@
 
   <!-- Connections -->
   <div class="section">
-    <div class="section-head"><h2>Connections</h2><button class="primary" style="font-size:11px;padding:4px 10px" onclick={createConnection}>+ New Connection</button></div>
+    <div class="section-head"><h2>Connections</h2><button class="primary" onclick={createConnection}>+ New Connection</button></div>
     {#if connections.length === 0}
       <div class="dim" style="text-align:center;padding:32px">No connections yet. Create a connection, assign a Bridge, Image, and Node — it will auto-start when all three are ready.</div>
     {:else}
@@ -150,7 +150,7 @@
               </select>
             </td>
             <td><span class="badge {c.status}">{c.status}</span></td>
-            <td class="actions"><button class="ghost small danger" onclick={() => deleteConnection(c.id)}>×</button></td>
+            <td class="actions"><button class="ghost danger" onclick={() => deleteConnection(c.id)}>×</button></td>
           </tr>
         {/each}
       </tbody>
@@ -160,7 +160,7 @@
 
   <!-- Bridges -->
   <div class="section">
-    <div class="section-head"><h2>Bridges</h2><button class="ghost small" onclick={() => showNewBridge = true}>+ New Bridge</button></div>
+    <div class="section-head"><h2>Bridges</h2><button class="ghost" onclick={() => showNewBridge = true}>+ New Bridge</button></div>
     {#if bridges.length === 0}
       <div class="dim" style="text-align:center;padding:20px">No bridges yet. Bridges are port configuration templates.</div>
     {:else}
@@ -171,7 +171,7 @@
           <tr>
             <td class="hi"><button class="ghost small mono" onclick={() => toggleBridge(br.id)}>{br.name}</button></td>
             <td><span class="badge loaded">{br.status}</span></td>
-            <td class="actions"><button class="ghost small danger" onclick={() => deleteBridge(br.id)}>×</button></td>
+            <td class="actions"><button class="ghost danger" onclick={() => deleteBridge(br.id)}>×</button></td>
           </tr>
           {#if expandedBridge === br.id && bridgeDetail}
             <tr><td colspan="3">
@@ -186,7 +186,7 @@
 
   <!-- Images -->
   <div class="section">
-    <div class="section-head"><h2>Images</h2><button class="primary" style="font-size:11px;padding:4px 10px" onclick={() => showLoad = true}>+ Load Image</button></div>
+    <div class="section-head"><h2>Images</h2><button class="primary" onclick={() => showLoad = true}>+ Load Image</button></div>
     <table>
       <thead><tr><th>Name</th><th>Source</th><th>Type</th><th>Status</th></tr></thead>
       <tbody>

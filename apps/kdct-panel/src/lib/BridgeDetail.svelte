@@ -85,7 +85,7 @@
             <td>{#if p.mode === 'direct'}<span class="badge direct">direct</span>{:else}<span class="badge route">route</span>{/if}</td>
             <td class="dim">{p.mode === 'route' ? (p.route_path || '-') : '-'}</td>
             <td class="dim">{p.mode === 'direct' ? (p.protocols || 'tcp') : 'http'}</td>
-            <td><button class="ghost small danger" onclick={() => deletePort(p.container_port)}>×</button></td>
+            <td><button class="ghost danger" onclick={() => deletePort(p.container_port)}>×</button></td>
           </tr>
         {/each}
       </tbody>
@@ -104,12 +104,12 @@
         <label style="font-size:10px;display:flex;align-items:center;gap:2px"><input type="checkbox" bind:group={portProtocols} value="tcp" />TCP</label>
         <label style="font-size:10px;display:flex;align-items:center;gap:2px"><input type="checkbox" bind:group={portProtocols} value="udp" />UDP</label>
       {/if}
-      <button class="ghost small" onclick={addPort}>Add</button>
-      <button class="ghost small" onclick={() => addingPort = false}>Cancel</button>
+      <button class="ghost" onclick={addPort}>Add</button>
+      <button class="ghost" onclick={() => addingPort = false}>Cancel</button>
     </div>
     {#if portMsg}<div class="dim" style="font-size:10px;color:var(--red)">{portMsg}</div>{/if}
   {:else}
-    <button class="ghost small" onclick={() => { addingPort = true; portContainerPort = 0; portMode = 'route'; portRoutePath = ''; portProtocols = ['tcp']; portMsg = ''; }} style="margin-bottom:8px">+ Add Port</button>
+    <button class="ghost" onclick={() => { addingPort = true; portContainerPort = 0; portMode = 'route'; portRoutePath = ''; portProtocols = ['tcp']; portMsg = ''; }} style="margin-bottom:8px">+ Add Port</button>
   {/if}
 
   <!-- Envs -->
@@ -119,7 +119,7 @@
       <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
       <tbody>
         {#each detail.envs as e}
-          <tr><td class="hi">{e.key}</td><td class="dim">{e.value}</td><td><button class="ghost small danger" onclick={() => deleteEnv(e.key)}>×</button></td></tr>
+          <tr><td class="hi">{e.key}</td><td class="dim">{e.value}</td><td><button class="ghost danger" onclick={() => deleteEnv(e.key)}>×</button></td></tr>
         {/each}
       </tbody>
     </table>
@@ -128,12 +128,12 @@
     <div class="config-row" style="margin-bottom:8px">
       <input bind:value={envKey} placeholder="KEY" style="flex:1" />
       <input bind:value={envVal} placeholder="VALUE" style="flex:2" />
-      <button class="ghost small" onclick={addEnv}>Add</button>
-      <button class="ghost small" onclick={() => addingEnv = false}>Cancel</button>
+      <button class="ghost" onclick={addEnv}>Add</button>
+      <button class="ghost" onclick={() => addingEnv = false}>Cancel</button>
     </div>
     {#if envMsg}<div class="dim" style="font-size:10px;color:var(--red)">{envMsg}</div>{/if}
   {:else}
-    <button class="ghost small" onclick={() => { addingEnv = true; envKey = ''; envVal = ''; envMsg = ''; }}>+ Add Env</button>
+    <button class="ghost" onclick={() => { addingEnv = true; envKey = ''; envVal = ''; envMsg = ''; }}>+ Add Env</button>
   {/if}
 
   <!-- Deploy info removed — connections handle deployment -->
