@@ -17,3 +17,15 @@
 # Internal docs
 PLAN.md
 
+# ---> Web panel
+apps/kdct-panel/node_modules/
+apps/kdct-panel/.svelte-kit/
+apps/kdct-panel/build/
+dist/
+.DS_Store
+.opencode/
+.claude/
+kdct.db
+kdct.db-shm
+kdct.db-wal
+

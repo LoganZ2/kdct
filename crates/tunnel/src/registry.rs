@@ -6,11 +6,10 @@
 use crate::protocol::{ContainerInfo, ControlChannelCmd, Digest};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::info;
 
 /// Information about a connected client
-#[derive(Debug, Clone)]
 pub struct ClientEntry {
     pub service_name: String,
     pub hostname: String,
@@ -24,6 +23,8 @@ pub struct ClientEntry {
     pub running_containers: Vec<ContainerInfo>,
     /// Send commands to this client's control channel
     pub cmd_tx: mpsc::Sender<ControlChannelCmd>,
+    /// Pending Docker response channels, keyed by container_name
+    pub pending_docker: Arc<RwLock<HashMap<String, oneshot::Sender<Result<Vec<u16>, String>>>>>,
 }
 
 /// Shared client registry, indexed by service digest.
@@ -49,6 +50,7 @@ pub async fn upsert(
     memory_mb: u64,
     running_containers: Vec<ContainerInfo>,
     cmd_tx: mpsc::Sender<ControlChannelCmd>,
+    pending_docker: Arc<RwLock<HashMap<String, oneshot::Sender<Result<Vec<u16>, String>>>>>,
 ) {
     let mut guard = registry.write().await;
     let is_new = !guard.contains_key(&digest);
@@ -66,6 +68,7 @@ pub async fn upsert(
             memory_mb,
             running_containers,
             cmd_tx,
+            pending_docker,
         },
     );
     if is_new {

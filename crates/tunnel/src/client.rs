@@ -368,32 +368,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // Send ReportNodeStatus to register with the server
         {
-            let hostname = get_hostname();
-            let os = std::env::consts::OS.to_string();
-            let arch = std::env::consts::ARCH.to_string();
-            let docker_version = get_docker_version();
-            let (port_range_start, port_range_end) = self.service.port_range();
-            let cpu_cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
-            let memory_mb = get_memory_mb();
-            let running_containers = get_running_containers().await;
-
             let mut guard = wr.lock().await;
-            if let Err(e) = protocol::write_control_cmd(
-                &mut *guard,
-                &ControlChannelCmd::ReportNodeStatus {
-                    hostname,
-                    os,
-                    arch,
-                    docker_version,
-                    port_range_start,
-                    port_range_end,
-                    cpu_cores,
-                    memory_mb,
-                    running_containers,
-                },
-            )
-            .await
-            {
+            let cmd = gather_node_status(&self.service).await;
+            if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
                 warn!("Failed to send ReportNodeStatus: {:#}", e);
             }
         }
@@ -406,6 +383,8 @@ impl<T: 'static + Transport> ControlChannel<T> {
             socket_opts,
             service: self.service.clone(),
         });
+
+        let mut status_interval = time::interval(Duration::from_secs(5));
 
         loop {
             tokio::select! {
@@ -421,7 +400,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                 }
                             }.instrument(Span::current()));
                         },
-                        ControlChannelCmd::HeartBeat => (),
+                        ControlChannelCmd::HeartBeat => {
+                            let mut guard = wr.lock().await;
+                            let cmd = gather_node_status(&self.service).await;
+                            if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
+                                warn!("Failed to send heartbeat status: {:#}", e);
+                            }
+                        }
                         ControlChannelCmd::PortsAssigned { mappings } => {
                             info!("Server assigned ports: {:?}", mappings);
                         }
@@ -511,6 +496,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         other => {
                             info!("Unhandled command from server: {:?}", other);
                         }
+                    }
+                },
+                _ = status_interval.tick() => {
+                    let mut guard = wr.lock().await;
+                    let cmd = gather_node_status(&self.service).await;
+                    if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
+                        warn!("Failed to send periodic status: {:#}", e);
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
@@ -678,6 +670,29 @@ async fn get_running_containers() -> Vec<crate::protocol::ContainerInfo> {
         _ => Vec::new(),
     }
 }
+async fn gather_node_status(service: &ClientServiceConfig) -> ControlChannelCmd {
+    let hostname = get_hostname();
+    let os = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+    let docker_version = get_docker_version();
+    let (port_range_start, port_range_end) = service.port_range();
+    let cpu_cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let memory_mb = get_memory_mb();
+    let running_containers = get_running_containers().await;
+
+    ControlChannelCmd::ReportNodeStatus {
+        hostname,
+        os,
+        arch,
+        docker_version,
+        port_range_start,
+        port_range_end,
+        cpu_cores,
+        memory_mb,
+        running_containers,
+    }
+}
+
 async fn docker_pull(image: &str) -> Result<()> {
     use tokio::process::Command;
     info!("Pulling image: {}", image);

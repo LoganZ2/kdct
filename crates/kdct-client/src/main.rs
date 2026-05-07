@@ -25,8 +25,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
-    rathole::run(
-        rathole::cli::Cli {
+    tunnel::run(
+        tunnel::cli::Cli {
             config_path: Some(cli.config),
             server: false,
             client: true,

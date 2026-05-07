@@ -235,7 +235,7 @@ pub async fn read_hello<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Hello> {
         Hello::ControlChannelHello(v, _) | Hello::DataChannelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
+                    "Protocol version mismatched. Expected {}, got {}. Please update the tunnel crate.",
                     CURRENT_PROTO_VERSION,
                     v
                 );

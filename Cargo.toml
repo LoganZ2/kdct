@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rathole",
+    "crates/tunnel",
     "crates/kdct-server",
     "crates/kdct-client",
-    "apps/kdct-panel",
 ]
 
 [workspace.package]

@@ -48,13 +48,13 @@ async fn run_instance(
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
         RunMode::Client => {
             #[cfg(not(feature = "client"))]
-            panic!("The feature 'client' is not compiled in this binary. Please re-compile rathole");
+            panic!("The feature 'client' is not compiled in this binary. Please rebuild the tunnel crate with the client feature.");
             #[cfg(feature = "client")]
             run_client(config, shutdown_rx).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
-            panic!("The feature 'server' is not compiled in this binary. Please re-compile rathole");
+            panic!("The feature 'server' is not compiled in this binary. Please rebuild the tunnel crate with the server feature.");
             #[cfg(feature = "server")]
             run_server(config, shutdown_rx).await
         }

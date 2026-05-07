@@ -46,26 +46,6 @@ pub struct ClientNode {
     pub last_seen: i64,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Deployment {
-    pub id: i64,
-    pub image_node_id: i64,
-    pub client_node_id: i64,
-    pub status: String,
-    pub deployed_at: i64,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PortAllocation {
-    pub id: i64,
-    pub deployment_id: i64,
-    pub image_port_id: i64,
-    pub client_port: i64,
-    pub server_port: i64,
-}
-
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).context("Failed to open database")?;
@@ -134,26 +114,6 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'offline',
                 auth_digest TEXT UNIQUE,
                 last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS deployments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                image_node_id INTEGER NOT NULL UNIQUE,
-                client_node_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'running',
-                deployed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                FOREIGN KEY (image_node_id) REFERENCES image_nodes(id),
-                FOREIGN KEY (client_node_id) REFERENCES client_nodes(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS port_allocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                deployment_id INTEGER NOT NULL,
-                image_port_id INTEGER NOT NULL,
-                client_port INTEGER NOT NULL,
-                server_port INTEGER NOT NULL,
-                FOREIGN KEY (deployment_id) REFERENCES deployments(id) ON DELETE CASCADE,
-                FOREIGN KEY (image_port_id) REFERENCES image_ports(id)
             );
             ",
         )
@@ -346,89 +306,18 @@ impl Database {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    // ── Deployment operations ─────────────────────────────────
-
-    pub fn insert_deployment(&self, image_node_id: i64, client_node_id: i64) -> Result<i64> {
+    pub fn set_node_offline(&self, auth_digest: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO deployments (image_node_id, client_node_id, status) VALUES (?1, ?2, 'running')",
-            params![image_node_id, client_node_id],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    pub fn set_deployment_stopped(&self, image_node_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE deployments SET status='stopped' WHERE image_node_id=?1",
-            params![image_node_id],
+            "UPDATE client_nodes SET status='offline' WHERE auth_digest=?1",
+            params![auth_digest],
         )?;
         Ok(())
     }
 
-    pub fn get_deployment_by_image(&self, image_node_id: i64) -> Result<Option<Deployment>> {
+    pub fn mark_all_offline(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, image_node_id, client_node_id, status, deployed_at FROM deployments WHERE image_node_id=?1",
-        )?;
-        let mut rows = stmt.query_map(params![image_node_id], |row| {
-            Ok(Deployment {
-                id: row.get(0)?,
-                image_node_id: row.get(1)?,
-                client_node_id: row.get(2)?,
-                status: row.get(3)?,
-                deployed_at: row.get(4)?,
-            })
-        })?;
-        Ok(rows.next().transpose()?)
-    }
-
-    pub fn insert_port_allocation(
-        &self,
-        deployment_id: i64,
-        image_port_id: i64,
-        client_port: i64,
-        server_port: i64,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO port_allocations (deployment_id, image_port_id, client_port, server_port) VALUES (?1, ?2, ?3, ?4)",
-            params![deployment_id, image_port_id, client_port, server_port],
-        )?;
+        conn.execute("UPDATE client_nodes SET status='offline'", [])?;
         Ok(())
-    }
-
-    pub fn get_port_allocations(&self, deployment_id: i64) -> Result<Vec<PortAllocation>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, deployment_id, image_port_id, client_port, server_port FROM port_allocations WHERE deployment_id=?1",
-        )?;
-        let rows = stmt.query_map(params![deployment_id], |row| {
-            Ok(PortAllocation {
-                id: row.get(0)?,
-                deployment_id: row.get(1)?,
-                image_port_id: row.get(2)?,
-                client_port: row.get(3)?,
-                server_port: row.get(4)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    /// Get all port allocations with active deployments (for rebuilding RouteTable on restart)
-    pub fn get_active_routes(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT r.path, pa.server_port \
-             FROM image_routes r \
-             JOIN image_ports p ON r.image_port_id = p.id \
-             JOIN port_allocations pa ON pa.image_port_id = p.id \
-             JOIN deployments d ON d.id = pa.deployment_id \
-             WHERE d.status = 'running'",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 }

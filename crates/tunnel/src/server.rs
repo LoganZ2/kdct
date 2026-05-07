@@ -346,6 +346,10 @@ where
         let (cmd_tx, cmd_rx) = mpsc::channel::<ControlChannelCmd>(64);
         let cmd_tx_for_registry = cmd_tx.clone();
 
+        // Map for pending Docker response oneshots
+        let pending_docker: Arc<RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<Vec<u16>, String>>>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
@@ -418,6 +422,8 @@ where
             data_ch_req_tx: data_ch_req_tx_for_control,
             shutdown_tx: shutdown_tx.clone(),
             node_update_tx: node_update_tx.clone(),
+            hostname: None,
+            pending_docker: pending_docker.clone(),
         };
 
         tokio::spawn(
@@ -457,6 +463,8 @@ struct ControlChannel<T: Transport> {
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_tx: broadcast::Sender<bool>,
     node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
+    hostname: Option<String>,
+    pending_docker: Arc<RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<Vec<u16>, String>>>>>,
 }
 
 impl<T: Transport> ControlChannel<T> {
@@ -496,20 +504,32 @@ impl<T: Transport> ControlChannel<T> {
                                 memory_mb,
                                 running_containers.clone(),
                                 self.cmd_tx.clone(),
+                                self.pending_docker.clone(),
                             ).await;
 
                             let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
                                 digest: hex::encode(self.service_digest),
-                                hostname,
-                                os,
-                                arch,
-                                docker_version,
-                                port_range_start,
-                                port_range_end,
-                                cpu_cores,
-                                memory_mb,
-                                running_containers,
+                                event: crate::node_update::NodeEvent::Connected {
+                                    hostname: hostname.clone(),
+                                    os,
+                                    arch,
+                                    docker_version,
+                                    port_range_start,
+                                    port_range_end,
+                                    cpu_cores,
+                                    memory_mb,
+                                    running_containers: running_containers.clone(),
+                                },
                             }).await;
+                            self.hostname = Some(hostname);
+
+                            // Resolve any pending Docker oneshots for containers now running
+                            let mut pending = self.pending_docker.write().await;
+                            for c in &running_containers {
+                                if let Some(tx) = pending.remove(&c.container_name) {
+                                    let _ = tx.send(Ok(c.ports.clone()));
+                                }
+                            }
                         }
                         Ok(ControlChannelCmd::DockerPullProgress { image, status }) => {
                             info!("Docker pull progress: {} — {}", image, status);
@@ -519,12 +539,44 @@ impl<T: Transport> ControlChannel<T> {
                         }
                         Ok(ControlChannelCmd::ContainerStarted { container_name, ports }) => {
                             info!("Container started: {} ports:{:?}", container_name, ports);
+                            let mut pending = self.pending_docker.write().await;
+                            if let Some(tx) = pending.remove(&container_name) {
+                                let _ = tx.send(Ok(ports.clone()));
+                            }
+                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                digest: hex::encode(self.service_digest),
+                                event: crate::node_update::NodeEvent::ContainerStarted {
+                                    container_name: container_name.clone(),
+                                    ports,
+                                },
+                            });
                         }
                         Ok(ControlChannelCmd::ContainerStopped { container_name }) => {
                             info!("Container stopped: {}", container_name);
+                            let mut pending = self.pending_docker.write().await;
+                            if let Some(tx) = pending.remove(&container_name) {
+                                let _ = tx.send(Ok(vec![]));
+                            }
+                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                digest: hex::encode(self.service_digest),
+                                event: crate::node_update::NodeEvent::ContainerStopped {
+                                    container_name: container_name.clone(),
+                                },
+                            });
                         }
                         Ok(ControlChannelCmd::ContainerError { container_name, error }) => {
                             error!("Container error: {} — {}", container_name, error);
+                            let mut pending = self.pending_docker.write().await;
+                            if let Some(tx) = pending.remove(&container_name) {
+                                let _ = tx.send(Err(error.clone()));
+                            }
+                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                digest: hex::encode(self.service_digest),
+                                event: crate::node_update::NodeEvent::ContainerError {
+                                    container_name: container_name.clone(),
+                                    error: error.clone(),
+                                },
+                            });
                         }
                         Ok(_) => {
                             debug!("Unexpected control cmd from client");
@@ -579,6 +631,13 @@ impl<T: Transport> ControlChannel<T> {
         }
 
         info!("Control channel shutdown");
+
+        if let Some(hostname) = self.hostname.take() {
+            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                digest: hex::encode(self.service_digest),
+                event: crate::node_update::NodeEvent::Disconnected { hostname },
+            }).await;
+        }
 
         Ok(())
     }

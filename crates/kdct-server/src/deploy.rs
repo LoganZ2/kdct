@@ -1,11 +1,14 @@
 use anyhow::{bail, Context, Result};
-use rathole::protocol::ControlChannelCmd;
-use rathole::registry::ClientRegistry;
+use tunnel::protocol::ControlChannelCmd;
+use tunnel::registry::ClientRegistry;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
+use std::collections::HashMap;
+use tokio::time::{self, Duration};
 use tracing::info;
 
 use crate::db::Database;
+use crate::deployment_tracker::DeploymentTracker;
 use crate::proxy::RouteTable;
 
 /// Deploy an image to a client node.
@@ -13,11 +16,12 @@ pub async fn deploy_image(
     db: &Database,
     registry: &ClientRegistry,
     route_table: &Arc<RwLock<RouteTable>>,
-    pool: &Arc<rathole::port_pool::PortPool>,
+    pool: &Arc<tunnel::port_pool::PortPool>,
+    tracker: &DeploymentTracker,
+    _docker_results: &Arc<RwLock<HashMap<String, Result<Vec<u16>, String>>>>,
     image_name: &str,
     target_node_id: i64,
-) -> Result<()> {
-    // 1. Find the image
+) -> Result<String> {
     let image = db
         .get_image_by_name(image_name)?
         .context("Image not found. Use 'image load' first.")?;
@@ -30,7 +34,6 @@ pub async fn deploy_image(
         );
     }
 
-    // 2. Find the target node
     let nodes = db.list_nodes()?;
     let node = nodes
         .iter()
@@ -41,15 +44,12 @@ pub async fn deploy_image(
         bail!("Node '{}' is not online", node.hostname);
     }
 
-    // 3. Get image ports and routes
     let routes = db.get_image_routes(image.id)?;
     if routes.is_empty() {
         bail!("No ports configured for image '{}'", image_name);
     }
 
     let required_ports = routes.len() as u16;
-
-    // 4. Check free ports on the node
     let node_port_count = (node.port_range_end - node.port_range_start + 1) as u16;
     if node_port_count < required_ports {
         bail!(
@@ -60,7 +60,6 @@ pub async fn deploy_image(
         );
     }
 
-    // 5. Check free server pool ports
     let free_pool = pool.free_count().await;
     if free_pool < required_ports as usize {
         bail!(
@@ -70,7 +69,6 @@ pub async fn deploy_image(
         );
     }
 
-    // 6. Check route conflicts
     let table = route_table.write().await;
     for (_, route_path) in &routes {
         if let Some(route_path) = route_path {
@@ -82,7 +80,6 @@ pub async fn deploy_image(
     }
     drop(table);
 
-    // 7. Assign server ports from pool
     let local_ports: Vec<u16> = routes
         .iter()
         .map(|(port, _)| port.port as u16)
@@ -92,30 +89,39 @@ pub async fn deploy_image(
         .await
         .context("Failed to assign ports from pool")?;
 
-    // 8. Allocate client ports from node's range
     let mut client_port = node.port_range_start as u16;
     let mut port_map: Vec<(u16, u16)> = Vec::new();
+    let mut server_ports: Vec<u16> = Vec::new();
     for (_, server_port) in &mapping {
-        port_map.push((client_port as u16, *server_port));
+        port_map.push((client_port, *server_port));
+        server_ports.push(*server_port);
         client_port += 1;
     }
 
-    // 9. Find the client's control channel
-    let guard = registry.read().await;
-    let cmd_tx = guard
-        .values()
-        .find(|e| e.hostname == node.hostname)
-        .map(|e| e.cmd_tx.clone())
-        .context(format!("Client '{}' not found in registry", node.hostname))?;
-    drop(guard);
-
     let container_name = image_name.replace(['/', ':'], "-");
 
-    // Build image tag for deployment
+    let (node_digest, cmd_tx, pending_docker) = {
+        let guard = registry.read().await;
+        let digest = guard
+            .iter()
+            .find(|(_, v)| v.hostname == node.hostname)
+            .map(|(k, _)| hex::encode(k));
+        let cmd_tx = guard
+            .values()
+            .find(|e| e.hostname == node.hostname)
+            .map(|e| e.cmd_tx.clone())
+            .context(format!("Client '{}' not found in registry", node.hostname))?;
+        let pending = guard
+            .values()
+            .find(|e| e.hostname == node.hostname)
+            .map(|e| e.pending_docker.clone())
+            .context(format!("Client '{}' not found in registry", node.hostname))?;
+        (digest, cmd_tx, pending)
+    };
+
     let image_tag = match image.source_type.as_str() {
         "git" => {
-            // Send DockerBuild to client first
-            let branch = "main"; // TODO: make configurable
+            let branch = "main";
             let tag = format!("kdct:{}", image.name.replace('/', "-"));
             cmd_tx
                 .send(ControlChannelCmd::DockerBuild {
@@ -128,10 +134,9 @@ pub async fn deploy_image(
             info!("Sent DockerBuild for {} -> {}", image.source, tag);
             tag
         }
-        _ => image.source.clone(), // docker_hub: use source directly
+        _ => image.source.clone(),
     };
 
-    // Map (client_port, image_port) for DockerRun
     let docker_port_map: Vec<(u16, u16)> = routes
         .iter()
         .enumerate()
@@ -139,6 +144,13 @@ pub async fn deploy_image(
         .collect();
 
     let envs = db.get_image_envs(image.id).unwrap_or_default();
+
+    // Register a oneshot to wait for the Docker response
+    let (tx, rx) = oneshot::channel::<Result<Vec<u16>, String>>();
+    {
+        let mut pending = pending_docker.write().await;
+        pending.insert(container_name.clone(), tx);
+    }
 
     cmd_tx
         .send(ControlChannelCmd::DockerRun {
@@ -150,18 +162,38 @@ pub async fn deploy_image(
         .await
         .context("Failed to send DockerRun command")?;
 
-    // 10. Record deployment
-    let deployment_id = db.insert_deployment(image.id, node.id)?;
-    for (i, (image_port, _)) in routes.iter().enumerate() {
-        db.insert_port_allocation(
-            deployment_id,
-            image_port.id,
-            port_map[i].0 as i64,
-            port_map[i].1 as i64,
-        )?;
+    info!("DockerRun sent for '{}', waiting for container...", container_name);
+
+    let result = match time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(err_msg)) => {
+            // Clean up pending entry on error
+            let mut pending = pending_docker.write().await;
+            pending.remove(&container_name);
+            return Err(anyhow::anyhow!("{}", err_msg));
+        }
+        Err(_elapsed) => {
+            // Clean up pending entry on timeout
+            let mut pending = pending_docker.write().await;
+            pending.remove(&container_name);
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for container '{}' to start (check server logs)",
+                container_name
+            ));
+        }
+    };
+
+    if let Some(digest) = node_digest {
+        crate::deployment_tracker::record_deployment(
+            tracker,
+            image_name,
+            &container_name,
+            &digest,
+            server_ports.clone(),
+        )
+        .await;
     }
 
-    // 11. Update RouteTable
     let mut table = route_table.write().await;
     for (i, (_, route_path)) in routes.iter().enumerate() {
         if let Some(path) = route_path {
@@ -170,58 +202,63 @@ pub async fn deploy_image(
     }
     drop(table);
 
-    // 12. Update image status
-    db.update_image_status(image.id, "deployed")?;
-
     info!(
-        "Deployed '{}' -> '{}' (container={})",
-        image_name, node.hostname, container_name
-    );
-    println!(
-        "Deployed '{}' to '{}'. Container: {}",
-        image_name, node.hostname, container_name
+        "Deployed '{}' -> '{}' (container={}, ports={:?})",
+        image_name, node.hostname, container_name, result
     );
 
-    Ok(())
+    Ok(format!(
+        "Deployed '{}' to '{}'. Container: {} ({:?})",
+        image_name, node.hostname, container_name, result
+    ))
 }
 
-/// Stop a deployed image.
+/// Stop a deployed image on a specific node.
 pub async fn stop_image(
     db: &Database,
     registry: &ClientRegistry,
     route_table: &Arc<RwLock<RouteTable>>,
-    pool: &Arc<rathole::port_pool::PortPool>,
+    pool: &Arc<tunnel::port_pool::PortPool>,
+    tracker: &DeploymentTracker,
+    _docker_results: &Arc<RwLock<HashMap<String, Result<Vec<u16>, String>>>>,
     image_name: &str,
-) -> Result<()> {
-    let image = db
-        .get_image_by_name(image_name)?
-        .context("Image not found")?;
-
-    let deployment = db
-        .get_deployment_by_image(image.id)?
-        .context("Image is not deployed")?;
-
-    if deployment.status != "running" {
-        bail!("Image '{}' is not running", image_name);
-    }
-
-    // Find the node
+    target_node_id: i64,
+) -> Result<String> {
     let nodes = db.list_nodes()?;
     let node = nodes
         .iter()
-        .find(|n| n.id == deployment.client_node_id)
-        .context("Deployment node not found")?;
-
-    // Send DockerStop
-    let container_name = image_name.replace(['/', ':'], "-");
+        .find(|n| n.id == target_node_id)
+        .context(format!("Node {} not found", target_node_id))?;
 
     let guard = registry.read().await;
+    let node_digest = guard
+        .iter()
+        .find(|(_, v)| v.hostname == node.hostname)
+        .map(|(k, _)| hex::encode(k))
+        .context("Node not connected in registry")?;
     let cmd_tx = guard
-        .values()
-        .find(|e| e.hostname == node.hostname)
-        .map(|e| e.cmd_tx.clone())
-        .context(format!("Client '{}' not found in registry", node.hostname))?;
+        .iter()
+        .find(|(_, v)| v.hostname == node.hostname)
+        .map(|(_, v)| v.cmd_tx.clone())
+        .context("Node not connected in registry")?;
+    let pending_docker = guard
+        .iter()
+        .find(|(_, v)| v.hostname == node.hostname)
+        .map(|(_, v)| v.pending_docker.clone())
+        .context("Node not connected in registry")?;
     drop(guard);
+
+    let deployment = crate::deployment_tracker::get_deployment(tracker, image_name, &node_digest)
+        .await
+        .context("Image is not deployed on this node")?;
+
+    let container_name = image_name.replace(['/', ':'], "-");
+
+    let (tx, rx) = oneshot::channel::<Result<Vec<u16>, String>>();
+    {
+        let mut pending = pending_docker.write().await;
+        pending.insert(container_name.clone(), tx);
+    }
 
     cmd_tx
         .send(ControlChannelCmd::DockerStop {
@@ -230,22 +267,18 @@ pub async fn stop_image(
         .await
         .context("Failed to send DockerStop command")?;
 
-    // Remove routes from RouteTable
-    let allocations = db.get_port_allocations(deployment.id)?;
+    let _ = time::timeout(Duration::from_secs(30), rx).await;
+
     let mut table = route_table.write().await;
-    for alloc in &allocations {
-        table.remove_by_port(alloc.server_port as u16);
-        // Release server port
-        pool.release_by_port(alloc.server_port as u16).await;
+    for port in &deployment.server_ports {
+        table.remove_by_port(*port);
+        pool.release_by_port(*port).await;
     }
     drop(table);
 
-    // Update DB
-    db.set_deployment_stopped(image.id)?;
-    db.update_image_status(image.id, "stopped")?;
+    crate::deployment_tracker::remove_deployment(tracker, image_name, &node_digest).await;
 
-    info!("Stopped '{}'", image_name);
-    println!("Stopped '{}'", image_name);
+    info!("Stopped '{}' on '{}'", image_name, node.hostname);
 
-    Ok(())
+    Ok(format!("Stopped '{}' on '{}'", image_name, node.hostname))
 }

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-rathole = { path = "../rathole", features = ["client"] }
+tunnel = { path = "../tunnel", features = ["client"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 tracing = "0.1"
