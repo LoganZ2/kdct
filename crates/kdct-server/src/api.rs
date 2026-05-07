@@ -121,6 +121,29 @@ pub async fn run_api(
                     };
                     let ports = db.get_image_routes(img.id).unwrap_or_default();
                     let envs = db.get_image_envs(img.id).unwrap_or_default();
+
+                    let mut all_routed = true;
+                    let mut missing_ports: Vec<i64> = Vec::new();
+                    let mut conflict_paths: Vec<String> = Vec::new();
+
+                    {
+                        let rt = handle.block_on(route_table.read());
+                        for (p, route) in &ports {
+                            match route {
+                                Some(ref path) => {
+                                    if rt.resolve(path).is_some() {
+                                        conflict_paths.push(path.clone());
+                                        all_routed = false;
+                                    }
+                                }
+                                None => {
+                                    missing_ports.push(p.port);
+                                    all_routed = false;
+                                }
+                            }
+                        }
+                    }
+
                     let port_list: Vec<serde_json::Value> = ports.iter().map(|(p, route)| json!({
                         "id": p.id,
                         "image_node_id": p.image_node_id,
@@ -132,6 +155,20 @@ pub async fn run_api(
                         "key": k,
                         "value": v,
                     })).collect();
+
+                    let deployable = all_routed && ports.len() > 0;
+                    let deploy_error = if !deployable {
+                        if !missing_ports.is_empty() {
+                            Some(format!("Ports without routes: {:?}", missing_ports))
+                        } else if !conflict_paths.is_empty() {
+                            Some(format!("Route conflicts: {:?}", conflict_paths))
+                        } else {
+                            Some("No ports configured".to_string())
+                        }
+                    } else {
+                        None
+                    };
+
                     respond_json(&json!({
                         "id": img.id,
                         "name": img.name,
@@ -141,6 +178,8 @@ pub async fn run_api(
                         "created_at": img.created_at,
                         "ports": port_list,
                         "envs": env_list,
+                        "deployable": deployable,
+                        "deploy_error": deploy_error,
                     }))
                 }
 
@@ -348,6 +387,64 @@ pub async fn run_api(
                             "result": job.result,
                         })),
                         None => error_json("Job not found", 404),
+                    }
+                }
+
+                (&tiny_http::Method::Post, "/api/image/route") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let image_name = parsed["image"].as_str().unwrap_or("");
+                    let port = parsed["port"].as_i64().unwrap_or(0);
+                    let path = parsed["path"].as_str().unwrap_or("");
+                    if image_name.is_empty() || port == 0 || path.is_empty() {
+                        return error_json("Missing 'image', 'port', or 'path'", 400);
+                    }
+                    let db2 = db.clone();
+                    let image_name = image_name.to_string();
+                    let path = path.to_string();
+                    match handle.block_on(async move {
+                        image::configure_route(db2.as_ref(), &image_name, port, &path).await
+                    }) {
+                        Ok(_) => tiny_http::Response::from_string("Route configured"),
+                        Err(e) => error_json(&format!("{:#}", e), 500),
+                    }
+                }
+
+                (&tiny_http::Method::Post, "/api/image/env") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let image_name = parsed["image"].as_str().unwrap_or("");
+                    let envs = parsed["envs"].as_array();
+                    if image_name.is_empty() || envs.is_none() {
+                        return error_json("Missing 'image' or 'envs' array", 400);
+                    }
+                    let pairs: Vec<(String, String)> = envs.unwrap().iter().filter_map(|e| {
+                        let key = e["key"].as_str()?;
+                        let value = e["value"].as_str()?;
+                        Some((key.to_string(), value.to_string()))
+                    }).collect();
+                    let db2 = db.clone();
+                    let image_name = image_name.to_string();
+                    match handle.block_on(async move {
+                        let img = db2.get_image_by_name(&image_name)?.ok_or_else(|| anyhow::anyhow!("Image not found"))?;
+                        db2.set_image_envs(img.id, &pairs)?;
+                        db2.update_image_status(img.id, "configured")?;
+                        Ok::<_, anyhow::Error>(())
+                    }) {
+                        Ok(_) => tiny_http::Response::from_string("Environment configured"),
+                        Err(e) => error_json(&format!("{:#}", e), 500),
                     }
                 }
 
