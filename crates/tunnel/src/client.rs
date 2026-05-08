@@ -475,53 +475,11 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         ControlChannelCmd::PortsAssigned { mappings } => {
                             info!("Server assigned ports: {:?}", mappings);
                         }
-                        ControlChannelCmd::DockerPull { image } => {
-                            let wr = wr.clone();
-                            tokio::spawn(async move {
-                                match docker_pull(&image).await {
-                                    Ok(()) => {
-                                        let mut guard = wr.lock().await;
-                                        let _ = protocol::write_control_cmd(&mut *guard, &ControlChannelCmd::DockerPullProgress {
-                                            image: image.clone(),
-                                            status: "complete".into(),
-                                        }).await;
-                                    }
-                                    Err(e) => {
-                                        let mut guard = wr.lock().await;
-                                        let _ = protocol::write_control_cmd(&mut *guard, &ControlChannelCmd::DockerPullProgress {
-                                            image: image.clone(),
-                                            status: format!("error:{}", e),
-                                        }).await;
-                                    }
-                                }
-                            });
-                        }
-                        ControlChannelCmd::DockerBuild { git_url, branch, image_tag } => {
-                            let wr = wr.clone();
-                            tokio::spawn(async move {
-                                match docker_build_from_git(&git_url, &branch, &image_tag).await {
-                                    Ok(()) => {
-                                        let mut guard = wr.lock().await;
-                                        let _ = protocol::write_control_cmd(&mut *guard, &ControlChannelCmd::DockerBuildProgress {
-                                            image_tag: image_tag.clone(),
-                                            status: "complete".into(),
-                                        }).await;
-                                    }
-                                    Err(e) => {
-                                        let mut guard = wr.lock().await;
-                                        let _ = protocol::write_control_cmd(&mut *guard, &ControlChannelCmd::DockerBuildProgress {
-                                            image_tag: image_tag.clone(),
-                                            status: format!("error:{}", e),
-                                        }).await;
-                                    }
-                                }
-                            });
-                        }
-                        ControlChannelCmd::DockerRun { image_tag, container_name, port_map, env } => {
+                        ControlChannelCmd::ImageStart { image_tag, source, source_type, container_name, port_map, env } => {
                             let wr = wr.clone();
                             let containers = self.containers.clone();
                             tokio::spawn(async move {
-                                match docker_run_managed(&image_tag, &container_name, &port_map, &env).await {
+                                match image_start(&image_tag, &source, &source_type, &container_name, &port_map, &env).await {
                                     Ok(ports) => {
                                         containers.lock().unwrap().push(TrackedContainer {
                                             container_name: container_name.clone(),
@@ -543,7 +501,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                 }
                             });
                         }
-                        ControlChannelCmd::DockerStop { container_name } => {
+                        ControlChannelCmd::ImageStop { container_name } => {
                             let wr = wr.clone();
                             let containers = self.containers.clone();
                             tokio::spawn(async move {
@@ -856,8 +814,10 @@ async fn docker_build_from_git(git_url: &str, branch: &str, image_tag: &str) -> 
     }
 }
 
-async fn docker_run_managed(
+async fn image_start(
     image_tag: &str,
+    source: &str,
+    source_type: &str,
     container_name: &str,
     port_map: &[(u16, u16)],
     env: &[(String, String)],
@@ -871,10 +831,15 @@ async fn docker_run_managed(
         let _ = Command::new("docker").args(["rm", "-f", container_name]).status().await;
     }
 
-    // Auto-pull if image not found locally
+    // Build or pull image if not found locally
     if !docker_image_exists(image_tag).await {
-        info!("Image '{}' not found locally, pulling...", image_tag);
-        docker_pull(image_tag).await?;
+        if source_type == "git" {
+            info!("Image '{}' not found locally, building from {}", image_tag, source);
+            docker_build_from_git(source, "main", image_tag).await?;
+        } else {
+            info!("Image '{}' not found locally, pulling...", image_tag);
+            docker_pull(source).await?;
+        }
         image_cache_record(image_tag);
     }
 

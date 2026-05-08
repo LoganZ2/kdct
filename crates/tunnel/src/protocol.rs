@@ -82,34 +82,24 @@ pub enum ControlChannelCmd {
         running_containers: Vec<ContainerInfo>,
     },
 
-    // ── Docker commands (Server → Client) ────────────────────
-    DockerPull {
-        image: String,
-    },
-    DockerBuild {
-        git_url: String,
-        branch: String,
+    // ── Image / Container lifecycle (Server → Client) ─────────
+    /// Start a container.  The client checks whether the image
+    /// exists locally; if not it pulls (docker_hub) or builds
+    /// (git).  Once running, the client reports ContainerStarted.
+    ImageStart {
         image_tag: String,
-    },
-    DockerRun {
-        image_tag: String,
+        source: String,
+        source_type: String,
         container_name: String,
         port_map: Vec<(u16, u16)>,
         env: Vec<(String, String)>,
     },
-    DockerStop {
+    /// Stop a container and remove it.
+    ImageStop {
         container_name: String,
     },
 
-    // ── Docker responses (Client → Server) ───────────────────
-    DockerPullProgress {
-        image: String,
-        status: String, // "pulling", "complete", "error:..."
-    },
-    DockerBuildProgress {
-        image_tag: String,
-        status: String, // "building", "complete", "error:..."
-    },
+    // ── Container responses (Client → Server) ─────────────────
     ContainerStarted {
         container_name: String,
         ports: Vec<u16>,

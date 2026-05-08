@@ -98,48 +98,7 @@ pub async fn deploy_connection(
     };
 
     let image_tag = match image.source_type.as_str() {
-        "git" => {
-            let tag = format!("kdct:{}", image.name.replace('/', "-"));
-            let build_key = format!("build:{}", tag);
-
-            // Register a oneshot for the build completion before sending the command,
-            // so DockerBuildProgress on the control channel can resolve it.
-            let (build_tx, build_rx) = oneshot::channel::<Result<Vec<u16>, String>>();
-            {
-                let mut pending = pending_docker.write().await;
-                pending.insert(build_key.clone(), build_tx);
-            }
-
-            cmd_tx.send(ControlChannelCmd::DockerBuild {
-                git_url: image.source.clone(),
-                branch: "main".into(),
-                image_tag: tag.clone(),
-            }).await.context("Failed to send DockerBuild command")?;
-
-            info!("DockerBuild sent for '{}', waiting for build to complete...", tag);
-
-            // Builds can take a while — give it 10 minutes.
-            match time::timeout(Duration::from_secs(600), build_rx).await {
-                Ok(Ok(Ok(_))) => {}
-                Ok(Ok(Err(err_msg))) => {
-                    pending_docker.write().await.remove(&build_key);
-                    for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
-                    return Err(anyhow::anyhow!("Image build failed: {}", err_msg));
-                }
-                Ok(Err(_)) => {
-                    pending_docker.write().await.remove(&build_key);
-                    for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
-                    return Err(anyhow::anyhow!("Build channel closed before completion"));
-                }
-                Err(_elapsed) => {
-                    pending_docker.write().await.remove(&build_key);
-                    for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
-                    return Err(anyhow::anyhow!("Timeout waiting for image '{}' to build", tag));
-                }
-            }
-
-            tag
-        }
+        "git" => format!("kdct:{}", image.name.replace('/', "-")),
         _ => image.source.clone(),
     };
 
@@ -156,26 +115,27 @@ pub async fn deploy_connection(
         pending.insert(container_name.clone(), tx);
     }
 
-    cmd_tx.send(ControlChannelCmd::DockerRun {
+    cmd_tx.send(ControlChannelCmd::ImageStart {
         image_tag: image_tag.clone(),
+        source: image.source.clone(),
+        source_type: image.source_type.clone(),
         container_name: container_name.clone(),
         port_map: docker_port_map,
         env: envs,
-    }).await.context("Failed to send DockerRun command")?;
+    }).await.context("Failed to send ImageStart command")?;
 
-    info!("DockerRun sent for '{}', waiting for container...", container_name);
+    info!("ImageStart sent for '{}' ({}), waiting for container...", container_name, image_tag);
 
-    let _result = match time::timeout(Duration::from_secs(60), rx).await {
-        Ok(Ok(res)) => res,
+    // Builds can take a while — give it 11 minutes total.
+    match time::timeout(Duration::from_secs(660), rx).await {
+        Ok(Ok(res)) => {}
         Ok(Err(err_msg)) => {
-            let mut pending = pending_docker.write().await;
-            pending.remove(&container_name);
+            pending_docker.write().await.remove(&container_name);
             for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
             return Err(anyhow::anyhow!("{}", err_msg));
         }
         Err(_elapsed) => {
-            let mut pending = pending_docker.write().await;
-            pending.remove(&container_name);
+            pending_docker.write().await.remove(&container_name);
             for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
             return Err(anyhow::anyhow!("Timeout waiting for container '{}' to start", container_name));
         }
@@ -231,7 +191,7 @@ pub async fn stop_connection(
         bail!("Connection is not deployed");
     }
 
-    // Try to send DockerStop if node is still online
+    // Try to send ImageStop if node is still online
     if let Some(nid) = node_id {
         if let Ok(Some(node)) = db.get_node_by_id(nid) {
             let guard = registry.read().await;
@@ -248,7 +208,7 @@ pub async fn stop_connection(
                     let mut pending = pending_docker.write().await;
                     pending.insert(container_name.clone(), tx);
                 }
-                let _ = cmd_tx.send(ControlChannelCmd::DockerStop {
+                let _ = cmd_tx.send(ControlChannelCmd::ImageStop {
                     container_name: container_name.clone(),
                 }).await;
                 let _ = time::timeout(Duration::from_secs(30), rx).await;

@@ -556,27 +556,6 @@ impl<T: Transport> ControlChannel<T> {
                                 }
                             }
                         }
-                        Ok(ControlChannelCmd::DockerPullProgress { image, status }) => {
-                            info!("Docker pull progress: {} — {}", image, status);
-                        }
-                        Ok(ControlChannelCmd::DockerBuildProgress { image_tag, status }) => {
-                            info!("Docker build progress: {} — {}", image_tag, status);
-                            // Resolve any deploy waiting on this build.
-                            // Key in pending_docker is "build:<image_tag>" — disambiguates
-                            // from container-name keys used by DockerRun.
-                            let key = format!("build:{}", image_tag);
-                            let mut pending = self.pending_docker.write().await;
-                            if let Some(tx) = pending.remove(&key) {
-                                if status == "complete" {
-                                    let _ = tx.send(Ok(vec![]));
-                                } else if let Some(err) = status.strip_prefix("error:") {
-                                    let _ = tx.send(Err(err.to_string()));
-                                } else {
-                                    // intermediate progress — re-insert
-                                    pending.insert(key, tx);
-                                }
-                            }
-                        }
                         Ok(ControlChannelCmd::ContainerStarted { container_name, ports }) => {
                             info!("Container started: {} ports:{:?}", container_name, ports);
                             let mut pending = self.pending_docker.write().await;

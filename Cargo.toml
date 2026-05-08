@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/tunnel",
     "crates/kdct-server",
-    "crates/kdct-client",
+    "crates/kdctc",
 ]
 
 [workspace.package]
