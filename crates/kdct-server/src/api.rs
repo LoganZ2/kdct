@@ -82,8 +82,6 @@ pub async fn run_api(
             let raw_path = request.url().to_string();
             let method = request.method();
             let raw_path_no_query = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
-            let was_admin_prefixed =
-                raw_path_no_query == "/admin" || raw_path_no_query.starts_with("/admin/");
             // Requests forwarded by Pingora arrive with the /admin prefix; strip it
             // so internal route matching stays prefix-agnostic. Direct localhost
             // access without /admin is also supported (root redirects to /admin/).
@@ -95,14 +93,6 @@ pub async fn run_api(
                 raw_path_no_query.clone()
             };
             let handle = Handle::current();
-
-            // Direct localhost browser access to the root → redirect to /admin/
-            // so SvelteKit's base path resolves correctly.
-            if !was_admin_prefixed && (path == "/" || path.is_empty()) && method == &tiny_http::Method::Get {
-                let resp = redirect("/admin/");
-                if let Err(e) = request.respond(resp) { error!("Failed to send response: {}", e); }
-                continue;
-            }
 
             let response = match (method, path.as_str()) {
                 // ── Nodes ────────────────────────────────────────
@@ -590,12 +580,6 @@ fn parse_slot(v: &serde_json::Value, key: &str) -> Option<Option<i64>> {
 fn extract_bridge_id(path: &str, suffix: &str) -> Option<i64> {
     let strip = path.strip_prefix("/api/bridges/")?.strip_suffix(suffix)?;
     strip.parse().ok()
-}
-
-fn redirect(location: &str) -> Resp {
-    tiny_http::Response::from_string("")
-        .with_status_code(tiny_http::StatusCode(302))
-        .with_header(tiny_http::Header::from_bytes("Location", location).unwrap())
 }
 
 fn respond_json(data: &serde_json::Value) -> Resp {
