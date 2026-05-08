@@ -6,6 +6,7 @@ export default defineConfig({
   server: {
     port: 9922,
     proxy: {
+      '/admin/api': 'http://127.0.0.1:9933',
       '/api': 'http://127.0.0.1:9933'
     }
   }

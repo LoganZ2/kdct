@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/rust-1.75+-orange.svg" alt="Rust 1.75+">
-  <img src="https://img.shields.io/badge/tls-rustls-green.svg" alt="TLS: rustls">
   <img src="https://img.shields.io/badge/proxy-pingora-blue.svg" alt="Proxy: Pingora">
+  <img src="https://img.shields.io/badge/ui-svelte_5-ff3e00.svg" alt="UI: Svelte 5">
   <img src="https://img.shields.io/badge/license-Apache--2.0-red.svg" alt="Apache 2.0">
 </p>
 
@@ -9,22 +9,52 @@
 
 Deploy Docker containers behind NAT to the public internet through a cheap VPS. Think `ngrok` + `fly.io`, but you own the infrastructure.
 
-Under the hood: an encrypted TCP tunnel (rathole fork) + HTTP reverse proxy (Pingora) + dynamic Docker orchestration.
+Under the hood: a custom TCP tunnel (rathole-derived) + HTTP reverse proxy (Pingora) + dynamic Docker orchestration, all driven by a Svelte web panel.
 
 ---
 
 ## Architecture
 
 ```
-  Internet                     VPS ($5/mo)                     Your Machine (NAT)
-  ─────────                    ──────────                      ──────────────────
+  Internet                    VPS  (kdcts)                       Your Machine  (kdctc, NAT)
+  ─────────                   ──────────────                     ────────────────────────────
 
-  https://app.example.com  →  kdcts (server)  ←── tunnel ──→  kdctc (client)
-                              │                                │
-                              Pingora proxy                    docker run
-                              /  → 127.0.0.1:9000              nginx:80
-                              /api → 127.0.0.1:9001            api:3000
+  https://app.example.com  →  Pingora :80 OR :443  ──┐           ┌── docker run ──┐
+                              (HTTP xor HTTPS,       │           │  nginx:80       │
+                               toggled in panel)     │           │  api:3000       │
+                              RouteTable             │           │                 │
+                              /admin   → 127.0.0.1:api_port      │  reports node   │
+                              /api/*   → bridge ports ←── encrypted TCP ──┤  status, runs   │
+                                                     │           │  Docker cmds    │
+                              tunnel server          │           └─────────────────┘
+                              (port pool 9000-9999)  │
+                                                     │
+                              tiny_http :api_port (default 9933, 127.0.0.1)
+                              REST API + Svelte panel  ←─ also exposed at /admin
+                              SQLite (kdct.db, server_config)
 ```
+
+The web panel (`apps/kdct-panel`) is the primary UI: load images, configure port→path bridges, wire up connections, watch nodes, toggle TLS — no CLI subcommands beyond `kdcts` / `kdctc` themselves. The panel is reachable two ways:
+
+- **Public**: `http(s)://<domain>/admin/` — forwarded by Pingora to the internal API port.
+- **Local**: `http://127.0.0.1:<api_port>/` — bound to loopback only, redirects `/` → `/admin/`.
+
+The `/admin` path is reserved — bridges cannot use it as a route path.
+
+---
+
+## Concepts
+
+KDCT splits a deployment into three editable pieces, joined by a **connection**:
+
+| Piece          | What it is                                                                  |
+|----------------|-----------------------------------------------------------------------------|
+| **Image**      | A Docker Hub image (`nginx:latest`) or a Git repo with a `Dockerfile`       |
+| **Bridge**     | Reusable port + env template — for each container port, route path / protocols / env vars |
+| **Node**       | A connected `kdctc` client — hostname, OS, Docker version, port range, CPU/mem |
+| **Connection** | `image × bridge × node` — once all three are set, KDCT auto-deploys         |
+
+A connection is "deployable" when it has a bridge, an image, and an online node assigned. The server polls every 5s and brings any pending-but-ready connection up.
 
 ---
 
@@ -32,30 +62,55 @@ Under the hood: an encrypted TCP tunnel (rathole fork) + HTTP reverse proxy (Pin
 
 ### 1. Server (VPS)
 
-```bash
+```toml
 # server.toml
 [server]
 bind_addr = "0.0.0.0:2333"
 default_token = "your-secret"
 port_pool = "9000-9999"
 domain = "myapp.example.com"
+
+# Pingora binds exactly one of these at a time (HTTP xor HTTPS), picked by
+# the TLS toggle in the admin panel.
 http_port = 80
+https_port = 443
+
+# Internal panel/API port. Bound to 127.0.0.1 only. Pingora forwards
+# <domain>/admin/* here.
+api_port = 9933
+
+# Required to enable TLS in the panel toggle. Comment out for HTTP-only.
+# tls_cert_path = "/etc/kdct/cert.pem"
+# tls_key_path  = "/etc/kdct/key.pem"
 
 [server.transport]
 type = "tcp"
 ```
 
 ```bash
-./kdcts start
+./kdcts --config server.toml
 ```
+
+The server binds three listeners:
+- `:2333` — tunnel control + data channels (clients connect here)
+- `:80` **or** `:443` — Pingora reverse proxy (public traffic, HTTP xor HTTPS)
+- `127.0.0.1:9933` — REST API + Svelte panel (also reachable as `<domain>/admin`)
+
+Docker must be installed on the server (used for the panel; the daemon is checked at startup).
 
 ### 2. Client (your machine behind NAT)
 
-```bash
+```toml
 # client.toml
 [client]
 remote_addr = "VPS_IP:2333"
 default_token = "your-secret"
+
+[client.services.my-node]
+type = "tcp"
+local_addr = "127.0.0.1:3000"
+port_range_start = 3000
+port_range_end = 3999
 
 [client.transport]
 type = "tcp"
@@ -65,46 +120,71 @@ type = "tcp"
 ./kdctc --config client.toml
 ```
 
-### 3. Deploy
+The client reports hostname, OS, arch, Docker version, port range, CPU cores, memory. Docker must be installed.
 
-```bash
-# Load image (auto-triggers interactive route config)
-./kdcts image load nginx:latest
-  → Port 80/tcp → Route path: /
+### 3. Deploy via the panel
 
-# Check nodes
-./kdcts node list
-  ID   HOSTNAME             STATUS   DOCKER
-  1    my-laptop.local      online   Docker version 29.x
+Open `http://<domain>/admin/` (public) or `http://VPS_IP:9933` (SSH-tunnel for safety) and:
 
-# Deploy
-./kdcts image deploy nginx:latest --to 1
+1. **Load an image** — `nginx:latest`, or a Git URL pointing at a repo with a `Dockerfile`
+2. **Create a bridge** — add ports (e.g. `80` → route mode, path `/`) and any env vars. `/admin` is reserved.
+3. **Create a connection** — pick the image, bridge, and target node
 
-# Visit
-curl https://myapp.example.com/
-```
+KDCT pulls/builds, picks a tunnel port from the pool, runs the container, wires the path into the route table, and serves `http(s)://myapp.example.com/`.
+
+### 4. Toggling TLS
+
+In the panel's **⚙ Settings** modal, flip the **TLS / HTTPS** switch. The setting is persisted in SQLite and applied on the next `kdcts` restart — the modal shows a *restart required* banner until the live mode matches. The toggle is disabled if `tls_cert_path` / `tls_key_path` are not set in `server.toml` or point to non-existent files.
 
 ---
 
 ## CLI Reference
 
+KDCT is panel-driven. The two binaries are daemons:
+
 ```
-kdcts start                          Start server daemon
-
-kdcts image load <source>            Load image, auto-trigger route config
-kdcts image config <name> [-p HOST:CONTAINER] [-e KEY=VALUE]
-                                      Add port mapping / env vars, 
-                                      auto-trigger route for new ports
-kdcts image deploy <name> --to <id>  Deploy to node
-kdcts image stop <name>              Stop and release
-kdcts image list                     List images
-kdcts image show <name>              Image details
-
-kdcts node list                      List nodes
-kdcts node show <id>                 Node details
-
-kdctc --config client.toml            Connect to server
+kdcts --config server.toml      Start the server (tunnel + proxy + panel API)
+kdctc --config client.toml      Connect a node to the server
 ```
+
+All deploy/stop/configure operations happen through the web panel (or directly against the REST API on `127.0.0.1:9933`).
+
+---
+
+## REST API (selected endpoints)
+
+The panel talks to the API on `127.0.0.1:<api_port>` directly, or via the public proxy at `<domain>/admin/api/...` (the API server transparently strips the `/admin` prefix).
+
+```
+GET    /api/overview              counts, online nodes, container count, pool free
+GET    /api/nodes                 list connected client nodes
+GET    /api/images                loaded images
+POST   /api/image/load            { source, name? }  →  job_id
+GET    /api/image/load/progress?job=<id>
+
+GET    /api/bridges               list port/env templates
+POST   /api/bridges               { name }
+GET    /api/bridges/{id}          bridge with ports + envs
+DELETE /api/bridges/{id}
+POST   /api/bridges/{id}/port     { container_port, mode, route_path?, protocols? }
+                                  route_path under /admin is rejected
+POST   /api/bridges/{id}/env      { envs: [{ key, value }, ...] }
+
+GET    /api/connections           list connections (joined with bridge/image/node names)
+POST   /api/connections           { name, bridge_id?, image_id?, node_id? }  → auto-deploys
+PATCH  /api/connections/{id}      change bridge/image/node (null clears) → auto-deploys
+DELETE /api/connections/{id}      stops + removes
+POST   /api/auto-check            kick the auto-deploy loop manually
+
+GET    /api/settings              { tls_enabled, live_tls_enabled, tls_configurable,
+                                    restart_required, http_port, https_port, api_port }
+POST   /api/settings              { tls_enabled: bool }  persists; restart to apply
+
+GET    /api/search?q=<query>      Docker Hub repo search
+GET    /api/tags?repo=<repo>      Docker Hub tags for a repo
+```
+
+`PATCH /api/connections/{id}` uses tri-state slots: omit a field to leave it, send `null` to clear it, send a number to set it.
 
 ---
 
@@ -114,12 +194,20 @@ kdctc --config client.toml            Connect to server
 
 ```toml
 [server]
-bind_addr = "0.0.0.0:2333"       # Rathole listen address
-default_token = "your-secret"     # Auth token
-port_pool = "9000-9999"           # Tunnel port range
-domain = "example.com"            # REQUIRED
-http_port = 80                    # Reverse proxy port (default 80)
-https_port = 0                    # 0 = disabled
+bind_addr = "0.0.0.0:2333"        # tunnel listen address
+default_token = "your-secret"     # SHA-256 token + nonce auth
+port_pool = "9000-9999"           # tunnel port range (server-side endpoints)
+domain = "example.com"            # REQUIRED — Pingora rejects other hosts with 404
+
+# Pingora binds exactly one of these at a time, picked by the panel TLS toggle.
+http_port = 80                    # used when TLS is OFF
+https_port = 443                  # used when TLS is ON
+
+api_port = 9933                   # internal panel + REST API (127.0.0.1 only)
+
+# Required if you intend to enable TLS in the panel toggle.
+tls_cert_path = "/etc/kdct/cert.pem"
+tls_key_path  = "/etc/kdct/key.pem"
 
 [server.transport]
 type = "tcp"
@@ -132,6 +220,12 @@ type = "tcp"
 remote_addr = "VPS_IP:2333"
 default_token = "your-secret"
 
+[client.services.<node-name>]
+type = "tcp"
+local_addr = "127.0.0.1:3000"     # legacy field, unused for Docker flow
+port_range_start = 3000           # client-side host ports for `docker run -p`
+port_range_end = 3999
+
 [client.transport]
 type = "tcp"
 ```
@@ -140,12 +234,17 @@ type = "tcp"
 
 ## How It Works
 
-1. Client connects → reports hostname, Docker version, port range, CPU, memory → stored in SQLite
-2. `image load` → server pulls image, inspects EXPOSE, asks for route path per port interactively
-3. `image deploy` → checks node online, ports available, no route conflict → sends DockerRun via tunnel
-4. Client `docker run` the container → server assigns tunnel ports → RouteTable updated
-5. External request → Pingora resolves path → tunnels to container through NAT
-6. Server restart → SQLite rebuilds RouteTable, clients reconnect with backoff
+1. Client connects → reports `ReportNodeStatus { hostname, os, arch, docker_version, port_range, cpu, mem, running_containers }` → upserted into SQLite (`client_nodes`)
+2. User loads an image via the panel — server records it (Git sources are shallow-cloned to verify a Dockerfile exists; the actual `docker build` runs on the client at deploy time)
+3. User creates a bridge — port → route_path mappings + env vars stored in `bridge_ports` / `bridge_envs`
+4. User creates a connection (image + bridge + node). Server verifies the node is online, the bridge has ports, the pool has free ports, and no route paths conflict
+5. Server assigns one server-side port per bridge port from the pool, sends `DockerBuild` (for Git images) then `DockerRun` over the control channel, waits for `ContainerStarted`
+6. Server registers each `route` port in `RouteTable` (`/api` → `127.0.0.1:9001`) and spawns an accept loop on the assigned tunnel port
+7. External request → Pingora `upstream_peer` resolves longest-prefix match → forwards to `127.0.0.1:<server_port>` → tunnel data channel → client `127.0.0.1:<client_port>` → container
+
+When a node disconnects, the server marks its connections `pending`, releases the pool ports, removes the routes, and tears down the accept loops. When the node reconnects with the connection still configured, the auto-check loop redeploys it.
+
+On server restart, all nodes are marked offline; clients reconnect with backoff and re-register, and the auto-check loop redeploys ready connections.
 
 ---
 
@@ -155,23 +254,60 @@ type = "tcp"
 git clone https://github.com/LoganZ2/kdct.git
 cd kdct
 
-# macOS: brew install cmake
+# Pingora needs cmake. On Debian/Ubuntu:
+#   sudo apt install cmake build-essential
+# On macOS:
+#   brew install cmake
+
+# Build the panel (Svelte 5 / SvelteKit static)
+cd apps/kdct-panel && npm install && npm run build && cd ../..
+
+# Build the binaries
 cargo build --release --workspace
 
 ./target/release/kdcts --help
 ./target/release/kdctc --help
 ```
 
+The `kdcts` binary expects the panel build output at `../../apps/kdct-panel/build` relative to its crate (resolved at compile time via `CARGO_MANIFEST_DIR`).
+
+---
+
+## Workspace Layout
+
+```
+kdct/
+├── crates/
+│   ├── tunnel/               TCP tunnel + Docker control protocol
+│   │   └── src/{client,server,protocol,registry,port_pool,transport}.rs
+│   ├── kdct-server/          server binary (kdcts)
+│   │   └── src/{main,api,db,deploy,deployment_tracker,image,proxy}.rs
+│   └── kdct-client/          client binary (kdctc)
+│       └── src/{main,docker}.rs
+└── apps/
+    └── kdct-panel/           Svelte 5 + Vite + SvelteKit static panel
+```
+
+---
+
+## Status / Caveats
+
+- **TLS**: built-in via `rustls`. User-provided cert + key paths only — no ACME / Let's Encrypt automation. Toggle with the panel; restart `kdcts` to apply.
+- **HTTP ↔ HTTPS is exclusive**: the proxy binds either `http_port` or `https_port`, never both. There's no automatic HTTP→HTTPS redirect — front with Caddy/nginx if you want one.
+- **`/admin` is reserved on the public domain**: bridges cannot use a route path of `/admin` or anything under `/admin/`.
+- **Panel API binds to `127.0.0.1:<api_port>`**: also reachable via the proxy at `<domain>/admin/`. It has no built-in auth, so if you don't want anyone with the domain hitting it, front the proxy with basic auth or a VPN.
+- **Per-client identity**: nodes are keyed by `auth_digest`, but `client_nodes.hostname` is also used as a registry key. Two clients sharing a hostname will currently collide.
+
 ---
 
 ## Why Not X
 
-| Alternative | Why KDCT instead |
-|-------------|-----------------|
-| ngrok / Cloudflare Tunnel | Metered, you don't own the infra |
-| frp / rathole alone | Static config per port, no Docker orchestration |
-| fly.io / Railway | Per-container pricing, no local-first workflow |
-| k3s / Kubernetes | Massive overhead for simple deploys |
+| Alternative                | Why KDCT instead                                                          |
+|----------------------------|---------------------------------------------------------------------------|
+| ngrok / Cloudflare Tunnel  | Metered, you don't own the infra                                          |
+| frp / rathole alone        | Static config per port, no Docker orchestration                           |
+| fly.io / Railway           | Per-container pricing, no local-first workflow                            |
+| k3s / Kubernetes           | Massive overhead for simple deploys                                       |
 
 ---
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { base } from '$app/paths';
   let { show = $bindable(false), onclose = () => {}, onloaded = () => {} } = $props();
 
   let searchQuery = $state('');
@@ -49,7 +50,7 @@
     if (searchQuery.length < 2) { searchResults = []; return; }
     searching = true;
     searchTimer = setTimeout(async () => {
-      try { searchResults = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`).then(r => r.json()); } catch { searchResults = []; }
+      try { searchResults = await fetch(`${base}/api/search?q=${encodeURIComponent(searchQuery)}`).then(r => r.json()); } catch { searchResults = []; }
       searching = false;
     }, 250) as unknown as number;
   }
@@ -58,7 +59,7 @@
     selectedRepo = repo; selectedTag = ''; customName = repo; searchQuery = ''; searchResults = [];
     tags = []; tagPage = 1; hasMoreTags = false; tagFilter = ''; loadingTags = true;
     try {
-      const res = await fetch(`/api/tags?repo=${encodeURIComponent(repo)}&page=1`);
+      const res = await fetch(`${base}/api/tags?repo=${encodeURIComponent(repo)}&page=1`);
       const data = await res.json();
       tags = data.tags || []; hasMoreTags = data.has_next;
     } catch { tags = []; }
@@ -69,7 +70,7 @@
     if (!hasMoreTags || loadingTags) return;
     loadingTags = true; const nextPage = tagPage + 1;
     try {
-      const res = await fetch(`/api/tags?repo=${encodeURIComponent(selectedRepo)}&page=${nextPage}`);
+      const res = await fetch(`${base}/api/tags?repo=${encodeURIComponent(selectedRepo)}&page=${nextPage}`);
       const data = await res.json();
       tags = [...tags, ...(data.tags || [])]; hasMoreTags = data.has_next; tagPage = nextPage;
     } catch {}
@@ -87,7 +88,7 @@
     const name = customName.trim(); if (!name) return;
     loading = true; loadResult = ''; loadMsg = ''; loadLogs = []; loadJobId = '';
     try {
-      const res = await fetch('/api/image/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, name }) });
+      const res = await fetch(`${base}/api/image/load`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, name }) });
       const data = await res.json();
       if (data.job_id) { loadJobId = data.job_id; pollProgress(); }
       else { loadResult = 'err'; loadMsg = 'Failed to start job'; loading = false; }
@@ -98,7 +99,7 @@
     if (!loadJobId) return;
     (async () => {
       try {
-        const res = await fetch(`/api/image/load/progress?job=${loadJobId}`);
+        const res = await fetch(`${base}/api/image/load/progress?job=${loadJobId}`);
         const data = await res.json(); loadLogs = [...(data.logs || [])];
         if (data.status === 'done') { loadResult = 'ok'; loadMsg = data.result; loading = false; onloaded(); }
         else if (data.status === 'error') { loadResult = 'err'; loadMsg = data.result || 'Unknown error'; loading = false; }
@@ -114,7 +115,7 @@
     const name = manualName.trim() || source.replace(/[:/@]/g, '-');
     manualLoading = true; manualResult = ''; manualMsg = '';
     try {
-      const res = await fetch('/api/image/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, name }) });
+      const res = await fetch(`${base}/api/image/load`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, name }) });
       const data = await res.json();
       if (data.job_id) { loadJobId = data.job_id; pollManualProgress(); }
       else { manualResult = 'err'; manualMsg = 'Failed to start job'; manualLoading = false; }
@@ -125,7 +126,7 @@
     if (!loadJobId) return;
     (async () => {
       try {
-        const res = await fetch(`/api/image/load/progress?job=${loadJobId}`);
+        const res = await fetch(`${base}/api/image/load/progress?job=${loadJobId}`);
         const data = await res.json(); loadLogs = [...(data.logs || [])];
         if (data.status === 'done') { manualResult = 'ok'; manualMsg = data.result; manualLoading = false; onloaded(); }
         else if (data.status === 'error') { manualResult = 'err'; manualMsg = data.result || 'Unknown error'; manualLoading = false; }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { base } from '$app/paths';
   let { bridgeId, onlineNodes = [] }: {
     bridgeId: number;
     onlineNodes?: any[];
@@ -21,7 +22,7 @@
 
   async function refresh() {
     loading = true;
-    try { detail = await fetch(`/api/bridges/${bridgeId}`).then(r => r.json()); }
+    try { detail = await fetch(`${base}/api/bridges/${bridgeId}`).then(r => r.json()); }
     catch { detail = null; }
     loading = false;
   }
@@ -31,13 +32,19 @@
   async function addPort() {
     const portNum = parseInt(portContainerPort);
     if (!portNum) { portMsg = 'Enter a port number'; return; }
-    if (portMode === 'route' && !portRoutePath.startsWith('/')) { portMsg = 'Path must start with /'; return; }
+    if (portMode === 'route') {
+      if (!portRoutePath.startsWith('/')) { portMsg = 'Path must start with /'; return; }
+      if (portRoutePath === '/admin' || portRoutePath.startsWith('/admin/')) {
+        portMsg = "'/admin' is reserved for the management panel";
+        return;
+      }
+    }
     portMsg = '';
     try {
       const body: any = { container_port: portNum, mode: portMode };
       if (portMode === 'route') body.route_path = portRoutePath;
       if (portMode === 'direct') body.protocols = portProtocols;
-      const res = await fetch(`/api/bridges/${bridgeId}/port`, {
+      const res = await fetch(`${base}/api/bridges/${bridgeId}/port`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
       const text = await res.text();
@@ -49,7 +56,7 @@
   }
 
   async function deletePort(containerPort: number) {
-    await fetch(`/api/bridges/${bridgeId}/port/${containerPort}`, { method: 'DELETE' });
+    await fetch(`${base}/api/bridges/${bridgeId}/port/${containerPort}`, { method: 'DELETE' });
     refresh();
   }
 
@@ -59,7 +66,7 @@
     const pairs = [...cur, { key: envKey, value: envVal }];
     envMsg = '';
     try {
-      const res = await fetch(`/api/bridges/${bridgeId}/env`, {
+      const res = await fetch(`${base}/api/bridges/${bridgeId}/env`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });
@@ -72,7 +79,7 @@
     const cur = detail?.envs || [];
     const pairs = cur.filter((e: any) => e.key !== key);
     try {
-      await fetch(`/api/bridges/${bridgeId}/env`, {
+      await fetch(`${base}/api/bridges/${bridgeId}/env`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ envs: pairs }),
       });

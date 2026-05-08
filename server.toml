@@ -3,7 +3,20 @@ bind_addr = "0.0.0.0:2333"
 default_token = "test-token-123"
 port_pool = "9000-9999"
 domain = "localhost"
+
+# Public reverse proxy ports. Only one is used at a time, picked by the TLS
+# toggle in the admin panel. http_port is used when TLS is OFF, https_port
+# when TLS is ON.
 http_port = 8080
+https_port = 8443
+
+# Internal port for the panel + REST API. Bound to 127.0.0.1 only. The
+# public reverse proxy forwards <domain>/admin/* to this port.
+api_port = 9933
+
+# TLS material. Required if you want to enable TLS in the panel toggle.
+# tls_cert_path = "/etc/kdct/cert.pem"
+# tls_key_path  = "/etc/kdct/key.pem"
 
 [server.transport]
 type = "tcp"

@@ -201,6 +201,14 @@ fn default_http_port() -> u16 {
     80
 }
 
+fn default_https_port() -> u16 {
+    443
+}
+
+fn default_api_port() -> u16 {
+    9933
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -218,12 +226,21 @@ pub struct ServerConfig {
     /// Domain for reverse proxy (e.g. "example.com")
     #[serde(default)]
     pub domain: Option<String>,
-    /// HTTP port for reverse proxy (default 80)
+    /// HTTP port for reverse proxy (used when TLS is disabled, default 80)
     #[serde(default = "default_http_port")]
     pub http_port: u16,
-    /// HTTPS port for reverse proxy (0 = disabled)
-    #[serde(default)]
+    /// HTTPS port for reverse proxy (used when TLS is enabled, default 443)
+    #[serde(default = "default_https_port")]
     pub https_port: u16,
+    /// Internal port for the panel API + admin UI (default 9933, bound to 127.0.0.1)
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+    /// Path to a PEM-encoded TLS certificate (chain). Required when TLS is toggled on.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Path to a PEM-encoded TLS private key. Required when TLS is toggled on.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

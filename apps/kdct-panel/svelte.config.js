@@ -9,6 +9,9 @@ export default {
       assets: 'build',
       fallback: 'index.html',
       strict: false
-    })
+    }),
+    paths: {
+      base: '/admin'
+    }
   }
 };

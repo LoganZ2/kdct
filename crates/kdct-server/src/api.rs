@@ -13,13 +13,26 @@ use crate::db::Database;
 use crate::deploy;
 use crate::deployment_tracker::DeploymentTracker;
 use crate::image;
-use crate::proxy::RouteTable;
+use crate::proxy::{is_admin_path, RouteTable};
 use tunnel::port_pool::PortPool;
 use tunnel::registry::ClientRegistry;
 
-const API_PORT: u16 = 9933;
-
 type Resp = tiny_http::Response<Cursor<Vec<u8>>>;
+
+/// Live + persisted state for the TLS toggle. Cloned into the blocking API task.
+#[derive(Clone)]
+pub struct ApiSettings {
+    /// Whether the running Pingora task is currently using TLS.
+    pub live_tls_enabled: bool,
+    /// True if the server config supplied both a cert and a key path.
+    pub tls_configurable: bool,
+    /// Public HTTP port (used when TLS is off).
+    pub http_port: u16,
+    /// Public HTTPS port (used when TLS is on).
+    pub https_port: u16,
+    /// Internal panel/API port.
+    pub api_port: u16,
+}
 
 #[derive(Clone)]
 pub struct LoadJob {
@@ -43,13 +56,14 @@ pub async fn run_api(
     tracker: DeploymentTracker,
     _docker_results: Arc<RwLock<HashMap<String, Result<Vec<u16>, String>>>>,
     job_registry: JobRegistry,
+    settings: ApiSettings,
 ) -> Result<()> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", API_PORT))?;
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", settings.api_port))?;
     let server = tiny_http::Server::from_listener(listener, None)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let panel = panel_dir();
     let job_registry = job_registry.clone();
-    info!("Panel API listening on http://127.0.0.1:{}", API_PORT);
+    info!("Panel API listening on http://127.0.0.1:{}", settings.api_port);
     info!("Serving panel from: {}", panel.display());
 
     let active_forwards: Arc<RwLock<Vec<(u16, tokio::sync::broadcast::Sender<bool>)>>> =
@@ -67,8 +81,28 @@ pub async fn run_api(
 
             let raw_path = request.url().to_string();
             let method = request.method();
-            let path = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
+            let raw_path_no_query = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
+            let was_admin_prefixed =
+                raw_path_no_query == "/admin" || raw_path_no_query.starts_with("/admin/");
+            // Requests forwarded by Pingora arrive with the /admin prefix; strip it
+            // so internal route matching stays prefix-agnostic. Direct localhost
+            // access without /admin is also supported (root redirects to /admin/).
+            let path = if let Some(rest) = raw_path_no_query.strip_prefix("/admin/") {
+                format!("/{}", rest)
+            } else if raw_path_no_query == "/admin" {
+                "/".to_string()
+            } else {
+                raw_path_no_query.clone()
+            };
             let handle = Handle::current();
+
+            // Direct localhost browser access to the root → redirect to /admin/
+            // so SvelteKit's base path resolves correctly.
+            if !was_admin_prefixed && (path == "/" || path.is_empty()) && method == &tiny_http::Method::Get {
+                let resp = redirect("/admin/");
+                if let Err(e) = request.respond(resp) { error!("Failed to send response: {}", e); }
+                continue;
+            }
 
             let response = match (method, path.as_str()) {
                 // ── Nodes ────────────────────────────────────────
@@ -177,6 +211,14 @@ pub async fn run_api(
                     let protocols_str = protocols.as_deref();
                     if container_port == 0 || (mode == "route" && route_path.is_none()) {
                         return error_json("Missing 'container_port' or 'route_path'", 400);
+                    }
+                    if let Some(rp) = route_path {
+                        if !rp.starts_with('/') {
+                            return error_json("route_path must start with '/'", 400);
+                        }
+                        if is_admin_path(rp) {
+                            return error_json("'/admin' is reserved for the management panel", 400);
+                        }
                     }
                     match db.insert_bridge_port(bridge_id, container_port, mode, route_path, protocols_str) {
                         Ok(_) => respond_json(&json!({"ok": true})),
@@ -341,6 +383,58 @@ pub async fn run_api(
 
                 (&tiny_http::Method::Get, "/api/ping") => { respond_json(&json!({"ok": true})) }
 
+                // ── Settings (TLS toggle, ports) ─────────────────
+                (&tiny_http::Method::Get, "/api/settings") => {
+                    let persisted_tls = db
+                        .get_setting("tls_enabled")
+                        .ok()
+                        .flatten()
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                    respond_json(&json!({
+                        "tls_enabled": persisted_tls,
+                        "live_tls_enabled": settings.live_tls_enabled,
+                        "tls_configurable": settings.tls_configurable,
+                        "restart_required": persisted_tls != settings.live_tls_enabled,
+                        "http_port": settings.http_port,
+                        "https_port": settings.https_port,
+                        "api_port": settings.api_port,
+                    }))
+                }
+
+                (&tiny_http::Method::Post, "/api/settings") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        return error_json("Failed to read body", 400);
+                    }
+                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                        Ok(v) => v,
+                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                    };
+                    let want_tls = match parsed.get("tls_enabled").and_then(|v| v.as_bool()) {
+                        Some(b) => b,
+                        None => return error_json("Missing 'tls_enabled' boolean", 400),
+                    };
+                    if want_tls && !settings.tls_configurable {
+                        return error_json(
+                            "Cannot enable TLS: tls_cert_path / tls_key_path not set in server.toml",
+                            400,
+                        );
+                    }
+                    let value = if want_tls { "true" } else { "false" };
+                    match db.set_setting("tls_enabled", value) {
+                        Ok(_) => {
+                            let restart_required = want_tls != settings.live_tls_enabled;
+                            respond_json(&json!({
+                                "ok": true,
+                                "tls_enabled": want_tls,
+                                "restart_required": restart_required,
+                            }))
+                        }
+                        Err(e) => error_json(&format!("{}", e), 500),
+                    }
+                }
+
                 // ── Docker Hub search ────────────────────────────
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/search") => {
                     let query = raw_path.split('?').nth(1).and_then(|qs| qs.split('&').find_map(|pair| {
@@ -496,6 +590,12 @@ fn parse_slot(v: &serde_json::Value, key: &str) -> Option<Option<i64>> {
 fn extract_bridge_id(path: &str, suffix: &str) -> Option<i64> {
     let strip = path.strip_prefix("/api/bridges/")?.strip_suffix(suffix)?;
     strip.parse().ok()
+}
+
+fn redirect(location: &str) -> Resp {
+    tiny_http::Response::from_string("")
+        .with_status_code(tiny_http::StatusCode(302))
+        .with_header(tiny_http::Header::from_bytes("Location", location).unwrap())
 }
 
 fn respond_json(data: &serde_json::Value) -> Resp {

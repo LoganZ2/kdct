@@ -84,9 +84,42 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     let http_port = server_config.http_port;
     let https_port = server_config.https_port;
+    let api_port = server_config.api_port;
     let db_path = PathBuf::from("kdct.db");
 
     let db = Database::open(&db_path)?;
+
+    // Resolve TLS configuration: persisted toggle in DB + cert/key paths from config.
+    let tls_configurable = match (
+        server_config.tls_cert_path.as_deref(),
+        server_config.tls_key_path.as_deref(),
+    ) {
+        (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => {
+            std::path::Path::new(c).is_file() && std::path::Path::new(k).is_file()
+        }
+        _ => false,
+    };
+    let tls_persisted = db
+        .get_setting("tls_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let tls_live = tls_persisted && tls_configurable;
+    if tls_persisted && !tls_configurable {
+        tracing::warn!(
+            "tls_enabled=true is persisted but tls_cert_path/tls_key_path are missing or invalid \
+             — falling back to plain HTTP. Fix the paths in server.toml and restart."
+        );
+    }
+    let tls_for_proxy = if tls_live {
+        Some(crate::proxy::TlsConfig {
+            cert_path: server_config.tls_cert_path.clone().unwrap_or_default(),
+            key_path: server_config.tls_key_path.clone().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
 
     let route_table = Arc::new(RwLock::new(RouteTable::new()));
 
@@ -181,8 +214,15 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let proxy_rt = route_table.clone();
             let proxy_domain = domain.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    proxy::run_proxy(proxy_rt, proxy_domain, http_port, https_port).await
+                if let Err(e) = proxy::run_proxy(
+                    proxy_rt,
+                    proxy_domain,
+                    api_port,
+                    http_port,
+                    https_port,
+                    tls_for_proxy,
+                )
+                .await
                 {
                     tracing::error!("Proxy error: {:#}", e);
                 }
@@ -195,9 +235,25 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let api_pool = pool.clone();
             let api_tracker = tracker.clone();
             let api_docker_results = docker_results.clone();
+            let api_settings = api::ApiSettings {
+                live_tls_enabled: tls_live,
+                tls_configurable,
+                http_port,
+                https_port,
+                api_port,
+            };
             tokio::spawn(async move {
-                if let Err(e) =
-                    api::run_api(api_db, api_clients, api_rt, api_pool, api_tracker, api_docker_results, Default::default()).await
+                if let Err(e) = api::run_api(
+                    api_db,
+                    api_clients,
+                    api_rt,
+                    api_pool,
+                    api_tracker,
+                    api_docker_results,
+                    Default::default(),
+                    api_settings,
+                )
+                .await
                 {
                     tracing::error!("API error: {:#}", e);
                 }

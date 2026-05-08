@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { base } from '$app/paths';
   import LoadImageModal from '$lib/LoadImageModal.svelte';
   import BridgeDetail from '$lib/BridgeDetail.svelte';
 
@@ -8,10 +9,12 @@
   let nodes: any[] = $state([]);
   let bridges: any[] = $state([]);
   let connections: any[] = $state([]);
+  let settings: any = $state(null);
   let err = $state('');
 
   let showLoad = $state(false);
   let showNewBridge = $state(false);
+  let showSettings = $state(false);
   let newBridgeName = $state('');
 
   let expandedBridge = $state<number | null>(null);
@@ -20,20 +23,37 @@
 
   async function refresh() {
     try {
-      const [ov, im, nd, br, cn] = await Promise.all([
-        fetch('/api/overview').then(r => r.json()),
-        fetch('/api/images').then(r => r.json()),
-        fetch('/api/nodes').then(r => r.json()),
-        fetch('/api/bridges').then(r => r.json()),
-        fetch('/api/connections').then(r => r.json()),
+      const [ov, im, nd, br, cn, st] = await Promise.all([
+        fetch(`${base}/api/overview`).then(r => r.json()),
+        fetch(`${base}/api/images`).then(r => r.json()),
+        fetch(`${base}/api/nodes`).then(r => r.json()),
+        fetch(`${base}/api/bridges`).then(r => r.json()),
+        fetch(`${base}/api/connections`).then(r => r.json()),
+        fetch(`${base}/api/settings`).then(r => r.json()),
       ]);
-      overview = ov; images = im; nodes = nd; bridges = br; connections = cn; err = '';
+      overview = ov; images = im; nodes = nd; bridges = br; connections = cn; settings = st; err = '';
     } catch { err = 'Cannot reach kdct server'; }
   }
 
   async function autoCheck() {
-    try { await fetch('/api/auto-check', { method: 'POST' }); } catch {}
+    try { await fetch(`${base}/api/auto-check`, { method: 'POST' }); } catch {}
     refresh();
+  }
+
+  async function toggleTls(want: boolean) {
+    try {
+      const res = await fetch(`${base}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tls_enabled: want }),
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        alert(e.error || `Failed to update TLS setting (${res.status})`);
+        return;
+      }
+      refresh();
+    } catch { alert('Failed to update TLS setting'); }
   }
 
   onMount(() => { refresh(); timer = setInterval(autoCheck, 5000); });
@@ -54,7 +74,7 @@
 
   async function deleteBridge(id: number) {
     if (!confirm('Delete this bridge?')) return;
-    await fetch(`/api/bridges/${id}`, { method: 'DELETE' });
+    await fetch(`${base}/api/bridges/${id}`, { method: 'DELETE' });
     if (expandedBridge === id) { expandedBridge = null; }
     refresh();
   }
@@ -62,28 +82,28 @@
   async function createBridge() {
     if (!newBridgeName) return;
     try {
-      await fetch('/api/bridges', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newBridgeName }) });
+      await fetch(`${base}/api/bridges`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newBridgeName }) });
       showNewBridge = false; newBridgeName = ''; refresh();
     } catch {}
   }
 
   async function createConnection() {
     try {
-      await fetch('/api/connections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'connection' }) });
+      await fetch(`${base}/api/connections`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'connection' }) });
       refresh();
     } catch {}
   }
 
   async function deleteConnection(id: number) {
     if (!confirm('Delete this connection?')) return;
-    await fetch(`/api/connections/${id}`, { method: 'DELETE' });
+    await fetch(`${base}/api/connections/${id}`, { method: 'DELETE' });
     refresh();
   }
 
   async function updateConnection(id: number, field: string, value: number | null) {
     const body: any = {};
     body[field] = value;
-    await fetch(`/api/connections/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    await fetch(`${base}/api/connections/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     refresh();
   }
 
@@ -95,6 +115,9 @@
 {/if}
 
 <div class="page">
+  <div class="topbar">
+    <button class="ghost small" onclick={() => showSettings = true}>⚙ Settings</button>
+  </div>
   {#if overview}
   <div class="stats">
     <div class="stat"><div class="stat-v">{overview.online_count}<span style="color:var(--text-dim);font-weight:400">/{overview.node_count}</span></div><div class="stat-l">Nodes online</div></div>
@@ -224,6 +247,43 @@
   </div>
   {/if}
 
+  <!-- Settings Modal -->
+  {#if showSettings}
+  <div class="overlay" onclick={() => showSettings = false} onkeydown={(e) => { if (e.key === 'Escape') showSettings = false; }}>
+    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+      <div class="modal-head"><span>Server <em>Settings</em></span><button class="ghost" onclick={() => showSettings = false}>Close</button></div>
+      {#if settings}
+        <div class="setting-row">
+          <div>
+            <div class="setting-title">TLS / HTTPS</div>
+            <div class="dim" style="font-size:11px">
+              Public reverse proxy is currently {settings.live_tls_enabled ? `serving HTTPS on :${settings.https_port}` : `serving HTTP on :${settings.http_port}`}.
+              {#if !settings.tls_configurable}
+                <br>To enable TLS, set <code>tls_cert_path</code> and <code>tls_key_path</code> in <code>server.toml</code>.
+              {/if}
+            </div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" checked={settings.tls_enabled} disabled={!settings.tls_configurable && !settings.tls_enabled} onchange={(e) => toggleTls(e.currentTarget.checked)} />
+            <span class="slider"></span>
+          </label>
+        </div>
+        {#if settings.restart_required}
+          <div class="msg warn">Restart <code>kdcts</code> to apply: persisted TLS = {settings.tls_enabled}, live = {settings.live_tls_enabled}.</div>
+        {/if}
+        <div class="setting-meta">
+          <div><span class="dim">Public HTTP port</span><span class="mono">{settings.http_port}</span></div>
+          <div><span class="dim">Public HTTPS port</span><span class="mono">{settings.https_port}</span></div>
+          <div><span class="dim">Panel API port</span><span class="mono">{settings.api_port}</span></div>
+          <div><span class="dim">Reserved path</span><span class="mono">/admin</span></div>
+        </div>
+      {:else}
+        <div class="dim">Loading…</div>
+      {/if}
+    </div>
+  </div>
+  {/if}
+
   <LoadImageModal bind:show={showLoad} onloaded={refresh} />
 </div>
 
@@ -248,4 +308,17 @@
   .slot-select { font-family: var(--mono); font-size: 11px; background: var(--bg); border: 1px solid var(--border2); color: var(--text-hi); padding: 4px 6px; border-radius: var(--radius); min-width: 100px; }
   .danger { color: var(--red) !important; }
   .small { font-size: 10px !important; padding: 3px 10px !important; }
+  .topbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+  .setting-row { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--border); gap: 16px; }
+  .setting-title { font-weight: 600; color: var(--text-hi); margin-bottom: 4px; }
+  .setting-meta { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; margin-top: 16px; font-size: 12px; }
+  .setting-meta .mono { font-family: var(--mono); color: var(--text-hi); }
+  .msg.warn { background: #4a2e00; color: #fbbf24; padding: 8px 12px; border-radius: var(--radius); margin-top: 12px; font-size: 12px; }
+  .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider { position: absolute; cursor: pointer; inset: 0; background: var(--surface2); transition: .2s; border-radius: 22px; }
+  .switch .slider:before { content: ""; position: absolute; height: 16px; width: 16px; left: 3px; bottom: 3px; background: var(--text-hi); transition: .2s; border-radius: 50%; }
+  .switch input:checked + .slider { background: #1e3a5f; }
+  .switch input:checked + .slider:before { transform: translateX(18px); background: #60a5fa; }
+  .switch input:disabled + .slider { opacity: 0.4; cursor: not-allowed; }
 </style>
