@@ -51,9 +51,11 @@ pub async fn deploy_connection(
         bail!("Node '{}' has only {} ports available, need {}", node.hostname, node_port_count, required_ports);
     }
 
-    let free_pool = pool.free_count().await;
-    if free_pool < required_ports as usize {
-        bail!("Server port pool only has {} free ports, need {}", free_pool, required_ports);
+    // Verify all ports have pre-allocated pool_port
+    for p in &ports {
+        if p.pool_port.is_none() {
+            bail!("Bridge port {} has no pool port assigned", p.container_port);
+        }
     }
 
     // Check route conflicts
@@ -68,17 +70,13 @@ pub async fn deploy_connection(
         }
     }
 
-    let container_ports: Vec<u16> = ports.iter().map(|p| p.container_port as u16).collect();
-    let mapping = pool.assign(&[image_id as u8], &container_ports)
-        .await
-        .context("Failed to assign ports from pool")?;
-
     let mut client_port = node.port_range_start as u16;
-    let mut port_map: Vec<(u16, u16)> = Vec::new();
+    let mut port_map: Vec<(u16, u16)> = Vec::new(); // (client_port, pool_port)
     let mut server_ports: Vec<u16> = Vec::new();
-    for (_, server_port) in &mapping {
-        port_map.push((client_port, *server_port));
-        server_ports.push(*server_port);
+    for p in &ports {
+        let pool_port = p.pool_port.unwrap() as u16;
+        port_map.push((client_port, pool_port));
+        server_ports.push(pool_port);
         client_port += 1;
     }
 
@@ -131,12 +129,10 @@ pub async fn deploy_connection(
         Ok(Ok(res)) => {}
         Ok(Err(err_msg)) => {
             pending_docker.write().await.remove(&container_name);
-            for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
             return Err(anyhow::anyhow!("{}", err_msg));
         }
         Err(_elapsed) => {
             pending_docker.write().await.remove(&container_name);
-            for (_, sp) in &mapping { pool.release_by_port(*sp).await; }
             return Err(anyhow::anyhow!("Timeout waiting for container '{}' to start", container_name));
         }
     };

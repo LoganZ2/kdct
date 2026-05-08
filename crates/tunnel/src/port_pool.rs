@@ -212,6 +212,16 @@ impl PortPool {
             .with_context(|| format!("Accept error on port {}", server_port))
     }
 
+    /// Reserve a single port from the pool (for bridge pre-allocation).
+    pub async fn reserve_one(&self) -> Option<u16> {
+        let mut free = self.free.write().await;
+        let mut assignments = self.assignments.write().await;
+        let port = free.pop_first()?;
+        assignments.insert(port, (vec![], 0));
+        info!("Port reserved: {}", port);
+        Some(port)
+    }
+
     /// Look up which (service_digest, local_port) a server_port is assigned to.
     pub async fn lookup(&self, server_port: u16) -> Option<(Vec<u8>, u16)> {
         self.assignments.read().await.get(&server_port).cloned()

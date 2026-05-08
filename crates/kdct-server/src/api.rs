@@ -148,6 +148,7 @@ pub async fn run_api(
                             let port_list: Vec<serde_json::Value> = ports.iter().map(|p| json!({
                                 "id": p.id, "container_port": p.container_port,
                                 "mode": p.mode, "route_path": p.route_path, "protocols": p.protocols,
+                                "pool_port": p.pool_port,
                             })).collect();
                             let env_list: Vec<serde_json::Value> = envs.iter().map(|(k, v)| json!({
                                 "key": k, "value": v,
@@ -210,9 +211,16 @@ pub async fn run_api(
                             return error_json("'/admin' is reserved for the management panel", 400);
                         }
                     }
-                    match db.insert_bridge_port(bridge_id, container_port, mode, route_path, protocols_str) {
-                        Ok(_) => respond_json(&json!({"ok": true})),
-                        Err(e) => error_json(&format!("{}", e), 500),
+                    let pool_port: Option<i64> = match handle.block_on(pool.reserve_one()) {
+                        Some(p) => Some(p as i64),
+                        None => return error_json("No free ports in pool", 503),
+                    };
+                    match db.insert_bridge_port(bridge_id, container_port, mode, route_path, protocols_str, pool_port) {
+                        Ok(_) => respond_json(&json!({"ok": true, "pool_port": pool_port})),
+                        Err(e) => {
+                            if let Some(pp) = pool_port { handle.block_on(pool.release_by_port(pp as u16)); }
+                            error_json(&format!("{}", e), 500)
+                        }
                     }
                 }
 
@@ -222,6 +230,9 @@ pub async fn run_api(
                     if parts.len() < 3 { return error_json("Invalid path", 400); }
                     let bridge_id: i64 = match parts[0].parse() { Ok(id) => id, Err(_) => return error_json("Invalid bridge id", 400) };
                     let container_port: i64 = match parts[2].parse() { Ok(p) => p, Err(_) => return error_json("Invalid port", 400) };
+                    if let Ok(Some(pp)) = db.get_bridge_port_pool_port(bridge_id, container_port) {
+                        handle.block_on(pool.release_by_port(pp as u16));
+                    }
                     match db.delete_bridge_port(bridge_id, container_port) {
                         Ok(_) => respond_json(&json!({"ok": true})),
                         Err(e) => error_json(&format!("{}", e), 500),

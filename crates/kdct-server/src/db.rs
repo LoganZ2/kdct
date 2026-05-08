@@ -27,6 +27,7 @@ pub struct BridgePort {
     pub mode: String,
     pub route_path: Option<String>,
     pub protocols: Option<String>,
+    pub pool_port: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ impl Database {
                 mode TEXT NOT NULL DEFAULT 'route',
                 route_path TEXT,
                 protocols TEXT,
+                pool_port INTEGER,
                 FOREIGN KEY (bridge_id) REFERENCES bridges(id) ON DELETE CASCADE
             );
 
@@ -276,11 +278,11 @@ impl Database {
 
     // ── Bridge ports ──────────────────────────────────────────
 
-    pub fn insert_bridge_port(&self, bridge_id: i64, container_port: i64, mode: &str, route_path: Option<&str>, protocols: Option<&str>) -> Result<i64> {
+    pub fn insert_bridge_port(&self, bridge_id: i64, container_port: i64, mode: &str, route_path: Option<&str>, protocols: Option<&str>, pool_port: Option<i64>) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO bridge_ports (bridge_id, container_port, mode, route_path, protocols) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![bridge_id, container_port, mode, route_path, protocols],
+            "INSERT INTO bridge_ports (bridge_id, container_port, mode, route_path, protocols, pool_port) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![bridge_id, container_port, mode, route_path, protocols, pool_port],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -288,7 +290,7 @@ impl Database {
     pub fn get_bridge_ports(&self, bridge_id: i64) -> Result<Vec<BridgePort>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, bridge_id, container_port, mode, route_path, protocols FROM bridge_ports WHERE bridge_id=?1 ORDER BY container_port",
+            "SELECT id, bridge_id, container_port, mode, route_path, protocols, pool_port FROM bridge_ports WHERE bridge_id=?1 ORDER BY container_port",
         )?;
         let rows = stmt.query_map(params![bridge_id], |row| {
             Ok(BridgePort {
@@ -298,6 +300,7 @@ impl Database {
                 mode: row.get(3)?,
                 route_path: row.get(4)?,
                 protocols: row.get(5)?,
+                pool_port: row.get(6)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
@@ -310,6 +313,14 @@ impl Database {
             params![bridge_id, container_port],
         )?;
         Ok(())
+    }
+
+    pub fn get_bridge_port_pool_port(&self, bridge_id: i64, container_port: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pool_port FROM bridge_ports WHERE bridge_id=?1 AND container_port=?2",
+        )?;
+        Ok(stmt.query_row(params![bridge_id, container_port], |row| row.get(0)).ok())
     }
 
     // ── Bridge envs ───────────────────────────────────────────
