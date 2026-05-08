@@ -153,18 +153,23 @@ pub async fn deploy_connection(
             }
         }
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
-        let has_udp = p.protocols.as_deref().unwrap_or("").split(',').any(|s| s.trim() == "udp");
+        let protocols = p.protocols.as_deref().unwrap_or("tcp");
+        let has_tcp = protocols.split(',').any(|s| s.trim() == "tcp");
+        let has_udp = protocols.split(',').any(|s| s.trim() == "udp");
+        if has_tcp || !has_udp { // TCP if selected, or fallback when neither
+            let shutdown_rx_tcp = shutdown_tx.subscribe();
+            spawn_port_accept_loop(
+                pool.clone(), server_port, port_map[i].0,
+                data_ch_req_tx.clone(), port_data_callbacks.clone(), shutdown_rx_tcp,
+            );
+        }
         if has_udp {
+            let shutdown_rx_udp = shutdown_tx.subscribe();
             spawn_port_udp_loop(
                 server_port,
                 data_ch_req_tx.clone(),
                 port_data_callbacks.clone(),
-                shutdown_rx,
-            );
-        } else {
-            spawn_port_accept_loop(
-                pool.clone(), server_port, port_map[i].0,
-                data_ch_req_tx.clone(), port_data_callbacks.clone(), shutdown_rx,
+                shutdown_rx_udp,
             );
         }
         active_forwards.write().await.push((server_port, shutdown_tx));
