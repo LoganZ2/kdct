@@ -168,132 +168,143 @@ pub async fn run_api(
                 }
 
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/bridges/") && !p.contains("/port") && !p.contains("/env") => {
-                    let rest = &p["/api/bridges/".len()..];
-                    let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
-                    let bridge_id: i64 = match id_str.parse() {
-                        Ok(id) => id,
-                        Err(_) => return error_json("Invalid bridge id", 400),
-                    };
-                    match db.get_bridge_by_id(bridge_id) {
-                        Ok(Some(b)) => {
-                            let ports = db.get_bridge_ports(bridge_id).unwrap_or_default();
-                            let envs = db.get_bridge_envs(bridge_id).unwrap_or_default();
-                            let port_list: Vec<serde_json::Value> = ports.iter().map(|p| json!({
-                                "id": p.id, "container_port": p.container_port,
-                                "mode": p.mode, "route_path": p.route_path, "protocols": p.protocols,
-                                "pool_port": p.pool_port,
-                            })).collect();
-                            let env_list: Vec<serde_json::Value> = envs.iter().map(|(k, v)| json!({
-                                "key": k, "value": v,
-                            })).collect();
-                            respond_json(&json!({ "bridge": b, "ports": port_list, "envs": env_list }))
+                    (|| {
+                        let rest = &p["/api/bridges/".len()..];
+                        let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
+                        let bridge_id: i64 = match id_str.parse() {
+                            Ok(id) => id,
+                            Err(_) => return error_json("Invalid bridge id", 400),
+                        };
+                        match db.get_bridge_by_id(bridge_id) {
+                            Ok(Some(b)) => {
+                                let ports = db.get_bridge_ports(bridge_id).unwrap_or_default();
+                                let envs = db.get_bridge_envs(bridge_id).unwrap_or_default();
+                                let port_list: Vec<serde_json::Value> = ports.iter().map(|p| json!({
+                                    "id": p.id, "container_port": p.container_port,
+                                    "mode": p.mode, "route_path": p.route_path, "protocols": p.protocols,
+                                    "pool_port": p.pool_port,
+                                })).collect();
+                                let env_list: Vec<serde_json::Value> = envs.iter().map(|(k, v)| json!({
+                                    "key": k, "value": v,
+                                })).collect();
+                                respond_json(&json!({ "bridge": b, "ports": port_list, "envs": env_list }))
+                            }
+                            Ok(None) => error_json("Bridge not found", 404),
+                            Err(e) => error_json(&format!("{}", e), 500),
                         }
-                        Ok(None) => error_json("Bridge not found", 404),
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                    })()
                 }
 
                 (&tiny_http::Method::Post, "/api/bridges") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        return error_json("Failed to read body", 400);
-                    }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(v) => v,
-                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
-                    };
-                    let bridge_name = parsed["name"].as_str().unwrap_or("");
-                    if bridge_name.is_empty() {
-                        return error_json("Missing 'name'", 400);
-                    }
-                    match db.insert_bridge(bridge_name) {
-                        Ok(id) => respond_json(&json!({"id": id, "name": bridge_name})),
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                    (|| {
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() {
+                            return error_json("Failed to read body", 400);
+                        }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                            Ok(v) => v,
+                            Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                        };
+                        let bridge_name = parsed["name"].as_str().unwrap_or("");
+                        if bridge_name.is_empty() {
+                            return error_json("Missing 'name'", 400);
+                        }
+                        match db.insert_bridge(bridge_name) {
+                            Ok(id) => respond_json(&json!({"id": id, "name": bridge_name})),
+                            Err(e) => error_json(&format!("{}", e), 500),
+                        }
+                    })()
                 }
 
                 (&tiny_http::Method::Delete, p) if p.starts_with("/api/bridges/") && !p.contains("/port") => {
-                    let rest = &p["/api/bridges/".len()..];
-                    let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
-                    let bridge_id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid bridge id", 400) };
-                    // Release pool ports before deleting bridge
-                    if let Ok(pool_ports) = db.get_bridge_pool_ports(bridge_id) {
-                        for pp in pool_ports {
-                            handle.block_on(pool.release_by_port(pp as u16));
+                    (|| {
+                        let rest = &p["/api/bridges/".len()..];
+                        let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
+                        let bridge_id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid bridge id", 400) };
+                        if let Ok(pool_ports) = db.get_bridge_pool_ports(bridge_id) {
+                            for pp in pool_ports {
+                                handle.block_on(pool.release_by_port(pp as u16));
+                            }
                         }
-                    }
-                    match db.delete_bridge(bridge_id) {
-                        Ok(_) => respond_json(&json!({"ok": true})),
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                        match db.delete_bridge(bridge_id) {
+                            Ok(_) => respond_json(&json!({"ok": true})),
+                            Err(e) => error_json(&format!("{}", e), 500),
+                        }
+                    })()
                 }
 
                 (&tiny_http::Method::Post, p) if p.ends_with("/port") => {
-                    let bridge_id = extract_bridge_id(p, "/port");
-                    let bridge_id = match bridge_id { Some(id) => id, None => return error_json("Invalid bridge id", 400) };
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
-                    let container_port = parsed["container_port"].as_i64().unwrap_or(0);
-                    let mode = parsed["mode"].as_str().unwrap_or("route");
-                    let route_path = parsed["route_path"].as_str();
-                    let protocols = parsed["protocols"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","));
-                    let protocols_str = protocols.as_deref();
-                    if container_port == 0 || (mode == "route" && route_path.is_none()) {
-                        return error_json("Missing 'container_port' or 'route_path'", 400);
-                    }
-                    if let Some(rp) = route_path {
-                        if !rp.starts_with('/') {
-                            return error_json("route_path must start with '/'", 400);
+                    (|| {
+                        let bridge_id = extract_bridge_id(p, "/port");
+                        let bridge_id = match bridge_id { Some(id) => id, None => return error_json("Invalid bridge id", 400) };
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
+                        let container_port = parsed["container_port"].as_i64().unwrap_or(0);
+                        let mode = parsed["mode"].as_str().unwrap_or("route");
+                        let route_path = parsed["route_path"].as_str();
+                        let protocols = parsed["protocols"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","));
+                        let protocols_str = protocols.as_deref();
+                        if container_port == 0 || (mode == "route" && route_path.is_none()) {
+                            return error_json("Missing 'container_port' or 'route_path'", 400);
                         }
-                        if is_admin_path(rp) {
-                            return error_json("'/admin' is reserved for the management panel", 400);
+                        if let Some(rp) = route_path {
+                            if !rp.starts_with('/') {
+                                return error_json("route_path must start with '/'", 400);
+                            }
+                            if is_admin_path(rp) {
+                                return error_json("'/admin' is reserved for the management panel", 400);
+                            }
                         }
-                    }
-                    let pool_port: Option<i64> = match handle.block_on(pool.reserve_one()) {
-                        Some(p) => Some(p as i64),
-                        None => return error_json("No free ports in pool", 503),
-                    };
-                    match db.insert_bridge_port(bridge_id, container_port, mode, route_path, protocols_str, pool_port) {
-                        Ok(_) => respond_json(&json!({"ok": true, "pool_port": pool_port})),
-                        Err(e) => {
-                            if let Some(pp) = pool_port { handle.block_on(pool.release_by_port(pp as u16)); }
-                            error_json(&format!("{}", e), 500)
+                        let pool_port: Option<i64> = match handle.block_on(pool.reserve_one()) {
+                            Some(p) => Some(p as i64),
+                            None => return error_json("No free ports in pool", 503),
+                        };
+                        match db.insert_bridge_port(bridge_id, container_port, mode, route_path, protocols_str, pool_port) {
+                            Ok(_) => respond_json(&json!({"ok": true, "pool_port": pool_port})),
+                            Err(e) => {
+                                if let Some(pp) = pool_port { handle.block_on(pool.release_by_port(pp as u16)); }
+                                error_json(&format!("{}", e), 500)
+                            }
                         }
-                    }
+                    })()
                 }
 
                 (&tiny_http::Method::Delete, p) if p.contains("/port/") => {
-                    let rest = &p["/api/bridges/".len()..];
-                    let parts: Vec<&str> = rest.split('/').collect();
-                    if parts.len() < 3 { return error_json("Invalid path", 400); }
-                    let bridge_id: i64 = match parts[0].parse() { Ok(id) => id, Err(_) => return error_json("Invalid bridge id", 400) };
-                    let container_port: i64 = match parts[2].parse() { Ok(p) => p, Err(_) => return error_json("Invalid port", 400) };
-                    if let Ok(Some(pp)) = db.get_bridge_port_pool_port(bridge_id, container_port) {
-                        handle.block_on(pool.release_by_port(pp as u16));
-                    }
-                    match db.delete_bridge_port(bridge_id, container_port) {
-                        Ok(_) => respond_json(&json!({"ok": true})),
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                    (|| {
+                        let rest = &p["/api/bridges/".len()..];
+                        let parts: Vec<&str> = rest.split('/').collect();
+                        if parts.len() < 3 { return error_json("Invalid path", 400); }
+                        let bridge_id: i64 = match parts[0].parse() { Ok(id) => id, Err(_) => return error_json("Invalid bridge id", 400) };
+                        let container_port: i64 = match parts[2].parse() { Ok(p) => p, Err(_) => return error_json("Invalid port", 400) };
+                        if let Ok(Some(pp)) = db.get_bridge_port_pool_port(bridge_id, container_port) {
+                            handle.block_on(pool.release_by_port(pp as u16));
+                        }
+                        match db.delete_bridge_port(bridge_id, container_port) {
+                            Ok(_) => respond_json(&json!({"ok": true})),
+                            Err(e) => error_json(&format!("{}", e), 500),
+                        }
+                    })()
                 }
 
                 (&tiny_http::Method::Post, p) if p.ends_with("/env") => {
-                    let bridge_id = extract_bridge_id(p, "/env");
-                    let bridge_id = match bridge_id { Some(id) => id, None => return error_json("Invalid bridge id", 400) };
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
-                    let envs = parsed["envs"].as_array();
-                    if envs.is_none() { return error_json("Missing 'envs' array", 400); }
-                    let pairs: Vec<(String, String)> = envs.unwrap().iter().filter_map(|e| {
-                        let key = e["key"].as_str()?; let value = e["value"].as_str()?;
-                        Some((key.to_string(), value.to_string()))
-                    }).collect();
-                    match db.set_bridge_envs(bridge_id, &pairs) {
-                        Ok(_) => respond_json(&json!({"ok": true})),
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                    (|| {
+                        let bridge_id = extract_bridge_id(p, "/env");
+                        let bridge_id = match bridge_id { Some(id) => id, None => return error_json("Invalid bridge id", 400) };
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
+                        let envs = parsed["envs"].as_array();
+                        if envs.is_none() { return error_json("Missing 'envs' array", 400); }
+                        let pairs: Vec<(String, String)> = envs.unwrap().iter().filter_map(|e| {
+                            let key = e["key"].as_str()?; let value = e["value"].as_str()?;
+                            Some((key.to_string(), value.to_string()))
+                        }).collect();
+                        match db.set_bridge_envs(bridge_id, &pairs) {
+                            Ok(_) => respond_json(&json!({"ok": true})),
+                            Err(e) => error_json(&format!("{}", e), 500),
+                        }
+                    })()
                 }
 
                 // ── Connections ───────────────────────────────────
@@ -305,85 +316,89 @@ pub async fn run_api(
                 }
 
                 (&tiny_http::Method::Post, "/api/connections") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
-                    let name = parsed["name"].as_str().unwrap_or("connection").to_string();
-                    match db.insert_connection(&name) {
-                        Ok(id) => {
-                            let bridge_id = parse_slot(&parsed, "bridge_id");
-                            let image_id = parse_slot(&parsed, "image_id");
-                            let node_id = parse_slot(&parsed, "node_id");
-                            if bridge_id.is_some() || image_id.is_some() || node_id.is_some() {
-                                let _ = db.update_connection(id, bridge_id, image_id, node_id);
+                    (|| {
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
+                        let name = parsed["name"].as_str().unwrap_or("connection").to_string();
+                        match db.insert_connection(&name) {
+                            Ok(id) => {
+                                let bridge_id = parse_slot(&parsed, "bridge_id");
+                                let image_id = parse_slot(&parsed, "image_id");
+                                let node_id = parse_slot(&parsed, "node_id");
+                                if bridge_id.is_some() || image_id.is_some() || node_id.is_some() {
+                                    let _ = db.update_connection(id, bridge_id, image_id, node_id);
+                                }
+                                let db2 = db.clone();
+                                let registry2 = registry.clone();
+                                let rt2 = route_table.clone();
+                                let pool2 = pool.clone();
+                                let tracker2 = tracker.clone();
+                                let fw2 = active_forwards.clone();
+                                handle.spawn(async move {
+                                    try_auto_deploy(&db2, &registry2, &rt2, &pool2, &tracker2, &fw2, id).await;
+                                });
+                                respond_json(&json!({"id": id, "name": name}))
                             }
-                            let db2 = db.clone();
-                            let registry2 = registry.clone();
-                            let rt2 = route_table.clone();
-                            let pool2 = pool.clone();
-                            let tracker2 = tracker.clone();
-                            let fw2 = active_forwards.clone();
-                            handle.spawn(async move {
-                                try_auto_deploy(&db2, &registry2, &rt2, &pool2, &tracker2, &fw2, id).await;
-                            });
-                            respond_json(&json!({"id": id, "name": name}))
+                            Err(e) => error_json(&format!("{}", e), 500),
                         }
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                    })()
                 }
 
                 (&tiny_http::Method::Patch, p) if p.starts_with("/api/connections/") => {
-                    let rest = &p["/api/connections/".len()..];
-                    let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
-                    let id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid id", 400) };
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
-                    let bridge_id = parse_slot(&parsed, "bridge_id");
-                    let image_id = parse_slot(&parsed, "image_id");
-                    let node_id = parse_slot(&parsed, "node_id");
-                    let _current_bridge = bridge_id.is_some();
-                    let _current_image = image_id.is_some();
-                    let current_node = node_id.is_some();
-                    // If node changed and we were deployed, stop first
-                    if current_node {
+                    (|| {
+                        let rest = &p["/api/connections/".len()..];
+                        let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
+                        let id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid id", 400) };
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
+                        let bridge_id = parse_slot(&parsed, "bridge_id");
+                        let image_id = parse_slot(&parsed, "image_id");
+                        let node_id = parse_slot(&parsed, "node_id");
+                        let _current_bridge = bridge_id.is_some();
+                        let _current_image = image_id.is_some();
+                        let current_node = node_id.is_some();
+                        if current_node {
+                            if let Ok(Some(conn)) = db.get_connection(id) {
+                                if conn["status"].as_str() == Some("deployed") {
+                                    let _ = handle.block_on(stop_connection_safe(&db, &registry, &route_table, &pool, &tracker, &active_forwards, id));
+                                }
+                            }
+                        }
+                        match db.update_connection(id, bridge_id, image_id, node_id) {
+                            Ok(_) => {
+                                let db2 = db.clone();
+                                let registry2 = registry.clone();
+                                let rt2 = route_table.clone();
+                                let pool2 = pool.clone();
+                                let tracker2 = tracker.clone();
+                                let fw2 = active_forwards.clone();
+                                handle.spawn(async move {
+                                    try_auto_deploy(&db2, &registry2, &rt2, &pool2, &tracker2, &fw2, id).await;
+                                });
+                                respond_json(&json!({"ok": true}))
+                            }
+                            Err(e) => error_json(&format!("{}", e), 500),
+                        }
+                    })()
+                }
+
+                (&tiny_http::Method::Delete, p) if p.starts_with("/api/connections/") => {
+                    (|| {
+                        let rest = &p["/api/connections/".len()..];
+                        let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
+                        let id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid id", 400) };
                         if let Ok(Some(conn)) = db.get_connection(id) {
                             if conn["status"].as_str() == Some("deployed") {
                                 let _ = handle.block_on(stop_connection_safe(&db, &registry, &route_table, &pool, &tracker, &active_forwards, id));
                             }
                         }
-                    }
-                    match db.update_connection(id, bridge_id, image_id, node_id) {
-                        Ok(_) => {
-                            let db2 = db.clone();
-                            let registry2 = registry.clone();
-                            let rt2 = route_table.clone();
-                            let pool2 = pool.clone();
-                            let tracker2 = tracker.clone();
-                            let fw2 = active_forwards.clone();
-                            handle.spawn(async move {
-                                try_auto_deploy(&db2, &registry2, &rt2, &pool2, &tracker2, &fw2, id).await;
-                            });
-                            respond_json(&json!({"ok": true}))
+                        match db.delete_connection(id) {
+                            Ok(_) => respond_json(&json!({"ok": true})),
+                            Err(e) => error_json(&format!("{}", e), 500),
                         }
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
-                }
-
-                (&tiny_http::Method::Delete, p) if p.starts_with("/api/connections/") => {
-                    let rest = &p["/api/connections/".len()..];
-                    let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
-                    let id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid id", 400) };
-                    // Stop if deployed
-                    if let Ok(Some(conn)) = db.get_connection(id) {
-                        if conn["status"].as_str() == Some("deployed") {
-                            let _ = handle.block_on(stop_connection_safe(&db, &registry, &route_table, &pool, &tracker, &active_forwards, id));
-                        }
-                    }
-                    match db.delete_connection(id) {
-                        Ok(_) => respond_json(&json!({"ok": true})),
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                    })()
                 }
 
                 (&tiny_http::Method::Post, "/api/auto-check") => {
@@ -444,40 +459,42 @@ pub async fn run_api(
                 }
 
                 (&tiny_http::Method::Post, "/api/settings") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        return error_json("Failed to read body", 400);
-                    }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(v) => v,
-                        Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
-                    };
-                    let want_tls = match parsed.get("tls_enabled").and_then(|v| v.as_bool()) {
-                        Some(b) => b,
-                        None => return error_json("Missing 'tls_enabled' boolean", 400),
-                    };
-                    if want_tls && !settings.tls_configurable {
-                        let msg = if !settings.domain_configured {
-                            "Cannot enable TLS: no `domain` set in server.toml. \
-                             Add a domain (and a matching cert/key) to use HTTPS."
-                        } else {
-                            "Cannot enable TLS: tls_cert_path / tls_key_path \
-                             not set or not pointing at real files in server.toml"
-                        };
-                        return error_json(msg, 400);
-                    }
-                    let value = if want_tls { "true" } else { "false" };
-                    match db.set_setting("tls_enabled", value) {
-                        Ok(_) => {
-                            let restart_required = want_tls != settings.live_tls_enabled;
-                            respond_json(&json!({
-                                "ok": true,
-                                "tls_enabled": want_tls,
-                                "restart_required": restart_required,
-                            }))
+                    (|| {
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() {
+                            return error_json("Failed to read body", 400);
                         }
-                        Err(e) => error_json(&format!("{}", e), 500),
-                    }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                            Ok(v) => v,
+                            Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                        };
+                        let want_tls = match parsed.get("tls_enabled").and_then(|v| v.as_bool()) {
+                            Some(b) => b,
+                            None => return error_json("Missing 'tls_enabled' boolean", 400),
+                        };
+                        if want_tls && !settings.tls_configurable {
+                            let msg = if !settings.domain_configured {
+                                "Cannot enable TLS: no `domain` set in server.toml. \
+                                 Add a domain (and a matching cert/key) to use HTTPS."
+                            } else {
+                                "Cannot enable TLS: tls_cert_path / tls_key_path \
+                                 not set or not pointing at real files in server.toml"
+                            };
+                            return error_json(msg, 400);
+                        }
+                        let value = if want_tls { "true" } else { "false" };
+                        match db.set_setting("tls_enabled", value) {
+                            Ok(_) => {
+                                let restart_required = want_tls != settings.live_tls_enabled;
+                                respond_json(&json!({
+                                    "ok": true,
+                                    "tls_enabled": want_tls,
+                                    "restart_required": restart_required,
+                                }))
+                            }
+                            Err(e) => error_json(&format!("{}", e), 500),
+                        }
+                    })()
                 }
 
                 // ── Docker Hub search ────────────────────────────
@@ -514,43 +531,45 @@ pub async fn run_api(
 
                 // ── Image load ───────────────────────────────────
                 (&tiny_http::Method::Post, "/api/image/load") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
-                    let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
-                    let source = parsed["source"].as_str().unwrap_or("");
-                    let custom_name = parsed["name"].as_str().filter(|s| !s.is_empty());
-                    if source.is_empty() { return error_json("Missing 'source'", 400); }
-                    let job_id = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-                    {
-                        let mut jobs = job_registry.lock().unwrap();
-                        jobs.insert(job_id.clone(), LoadJob { logs: vec!["Starting image load...".into()], status: "running".into(), result: String::new() });
-                    }
-                    let source = source.to_string();
-                    let custom_name = custom_name.map(|s| s.to_string());
-                    let db = db.clone();
-                    let jobs = job_registry.clone();
-                    let jid = job_id.clone();
-                    handle.spawn(async move {
-                        let mut log_line = |line: &str| {
-                            if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.logs.push(line.to_string()); } }
-                        };
-                        log_line(&format!("Loading: {}", source));
-
-                        if source.starts_with("http") || source.ends_with(".git") {
-                            log_line("Cloning git repository...");
+                    (|| {
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() { return error_json("Failed to read body", 400); }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) { Ok(v) => v, Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400) };
+                        let source = parsed["source"].as_str().unwrap_or("");
+                        let custom_name = parsed["name"].as_str().filter(|s| !s.is_empty());
+                        if source.is_empty() { return error_json("Missing 'source'", 400); }
+                        let job_id = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+                        {
+                            let mut jobs = job_registry.lock().unwrap();
+                            jobs.insert(job_id.clone(), LoadJob { logs: vec!["Starting image load...".into()], status: "running".into(), result: String::new() });
                         }
+                        let source = source.to_string();
+                        let custom_name = custom_name.map(|s| s.to_string());
+                        let db = db.clone();
+                        let jobs = job_registry.clone();
+                        let jid = job_id.clone();
+                        handle.spawn(async move {
+                            let mut log_line = |line: &str| {
+                                if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.logs.push(line.to_string()); } }
+                            };
+                            log_line(&format!("Loading: {}", source));
 
-                        match image::load_image(db.as_ref(), &source, custom_name.as_deref()).await {
-                            Ok(name) => {
-                                if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.status = "done".into(); job.result = format!("Image {} loaded successfully", name); } }
+                            if source.starts_with("http") || source.ends_with(".git") {
+                                log_line("Cloning git repository...");
                             }
-                            Err(e) => {
-                                log_line(&format!("{:#}", e));
-                                if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.status = "error".into(); job.result = format!("{:#}", e); } }
+
+                            match image::load_image(db.as_ref(), &source, custom_name.as_deref()).await {
+                                Ok(name) => {
+                                    if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.status = "done".into(); job.result = format!("Image {} loaded successfully", name); } }
+                                }
+                                Err(e) => {
+                                    log_line(&format!("{:#}", e));
+                                    if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.status = "error".into(); job.result = format!("{:#}", e); } }
+                                }
                             }
-                        }
-                    });
-                    respond_json(&json!({"job_id": job_id}))
+                        });
+                        respond_json(&json!({"job_id": job_id}))
+                    })()
                 }
 
                 (&tiny_http::Method::Get, p) if p.starts_with("/api/image/load/progress") => {
