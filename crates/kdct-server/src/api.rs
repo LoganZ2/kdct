@@ -63,7 +63,7 @@ pub async fn run_api(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let panel = panel_dir();
     let job_registry = job_registry.clone();
-    info!("Panel API listening on http://127.0.0.1:{}", settings.api_port);
+    info!("Panel API listening on http://127.0.0.1:{}/admin", settings.api_port);
     info!("Serving panel from: {}", panel.display());
 
     let active_forwards: Arc<RwLock<Vec<(u16, tokio::sync::broadcast::Sender<bool>)>>> =
@@ -83,8 +83,8 @@ pub async fn run_api(
             let method = request.method();
             let raw_path_no_query = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
             // Requests forwarded by Pingora arrive with the /admin prefix; strip it
-            // so internal route matching stays prefix-agnostic. Direct localhost
-            // access without /admin is also supported (root redirects to /admin/).
+            // so internal route matching stays prefix-agnostic.
+            let was_admin = raw_path_no_query == "/admin" || raw_path_no_query.starts_with("/admin/");
             let path = if let Some(rest) = raw_path_no_query.strip_prefix("/admin/") {
                 format!("/{}", rest)
             } else if raw_path_no_query == "/admin" {
@@ -510,7 +510,13 @@ pub async fn run_api(
                     }
                 }
 
-                _ => { serve_static(&panel, &path, &registry) }
+                _ => {
+                    if was_admin {
+                        serve_static(&panel, &path, &registry)
+                    } else {
+                        error_json("Not Found", 404)
+                    }
+                }
             };
 
             if let Err(e) = request.respond(response) {
