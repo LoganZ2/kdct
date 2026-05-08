@@ -92,13 +92,12 @@ jobs:
 
       - name: Generate THIRD_PARTY_LICENSES.html
         run: |
-          set +e
-          if cargo install --locked cargo-about 2>/dev/null; then
-            cargo about generate -c about.toml -o THIRD_PARTY_LICENSES.html about.hbs 2>/dev/null || true
-          fi
-          if [ ! -s THIRD_PARTY_LICENSES.html ]; then
-            echo "<html><body><p>Third-party licenses not available. See Cargo.lock for full dependency list.</p></body></html>" > THIRD_PARTY_LICENSES.html
-          fi
+          set -euo pipefail
+          echo "Installing cargo-about..."
+          cargo install --locked cargo-about
+          echo "Generating license report..."
+          cargo about generate -c about.toml -o THIRD_PARTY_LICENSES.html about.hbs
+          echo "Done: $(wc -c < THIRD_PARTY_LICENSES.html) bytes"
 
       - name: Stage release tarball
         id: stage
@@ -111,38 +110,7 @@ jobs:
           cp -R apps/kdct-panel/build/. "${STAGE}/panel/"
           cp LICENSE NOTICE README.md THIRD_PARTY_LICENSES.html "${STAGE}/"
           cp server.toml "${STAGE}/server.toml.example"
-          cat > "${STAGE}/INSTALL.txt" <<'EOF'
-          KDCT — installation
-          ===================
-
-          This archive contains:
-            kdcts                  server binary
-            kdctc                  client binary
-            panel/                 SvelteKit static panel served by kdcts
-            server.toml.example    sample server config
-            LICENSE                Apache-2.0 license text
-            NOTICE                 attribution for rathole and Pingora
-            THIRD_PARTY_LICENSES   license texts for all transitive deps
-            README.md              project documentation
-
-          The server looks for the panel in this order:
-            1. $KDCT_PANEL_DIR (env var)
-            2. <directory of kdcts>/panel/  (default — works as-shipped)
-            3. compile-time fallback (only useful for `cargo run`)
-
-          So if you keep `kdcts` and `panel/` in the same directory, it
-          just works. To put them elsewhere, set KDCT_PANEL_DIR.
-
-          Docker must be installed on whatever machine runs kdcts (used
-          for the Docker Hub search / image pre-checks).
-
-          Quick start:
-            cp server.toml.example server.toml
-            $EDITOR server.toml          # set domain, token, ports
-            ./kdcts --config server.toml
-
-          See README.md for the full client + panel walk-through.
-          EOF
+          cp client.toml "${STAGE}/client.toml.example"
           tar czf "${STAGE}.tar.gz" "${STAGE}"
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
           echo "tarball=${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
