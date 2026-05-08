@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>KDCT — Third-Party Licenses</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         max-width: 880px; margin: 2em auto; padding: 0 1em; line-height: 1.5; color: #222; }
+  h1 { border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  h2 { margin-top: 2em; }
+  h3 { margin: .2em 0; }
+  .overview a { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .license { border: 1px solid #ddd; border-radius: 4px; margin: 1em 0; padding: 1em 1.2em; }
+  .license h3 { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .used-by { font-size: .9em; color: #555; margin: .5em 0 1em; }
+  .used-by code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+  pre { background: #f7f7f7; padding: 1em; overflow-x: auto; font-size: .82em;
+        white-space: pre-wrap; word-break: break-word; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #ddd; }
+    h1 { border-color: #333; }
+    .license { border-color: #333; }
+    .used-by { color: #999; }
+    .used-by code { background: #222; }
+    pre { background: #1a1a1a; }
+    a { color: #6cf; }
+  }
+</style>
+</head>
+<body>
+<h1>KDCT — Third-Party Licenses</h1>
+<p>
+  KDCT is distributed under the <a href="LICENSE">Apache License, Version 2.0</a>.
+  The binaries in this release statically link the Rust crates listed below;
+  this document reproduces their license texts as required by Apache-2.0 §4.
+</p>
+
+<h2>Overview</h2>
+<ul class="overview">
+  {{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> &mdash; {{count}} crate{{#unless (eq count 1)}}s{{/unless}}</li>
+  {{/each}}
+</ul>
+
+<h2>License texts</h2>
+{{#each licenses}}
+<div class="license">
+  <h3 id="{{id}}">{{name}}</h3>
+  <div class="used-by">
+    Used by:
+    {{#each used_by}}
+      <code>{{this.crate.name}} {{this.crate.version}}</code>{{#unless @last}}, {{/unless}}
+    {{/each}}
+  </div>
+  <pre>{{text}}</pre>
+</div>
+{{/each}}
+</body>
+</html>

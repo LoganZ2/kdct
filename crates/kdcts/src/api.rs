@@ -44,6 +44,20 @@ pub struct LoadJob {
 pub type JobRegistry = Arc<Mutex<HashMap<String, LoadJob>>>;
 
 fn panel_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("KDCT_PANEL_DIR") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("panel");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/kdct-panel/build")
 }

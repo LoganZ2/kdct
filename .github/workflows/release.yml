@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0). A git tag of this name will be created."
+        required: true
+        type: string
+      draft:
+        description: "Create as draft release (uncheck to publish immediately)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_dir: target/x86_64-unknown-linux-gnu/release
+          - name: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+            artifact_dir: target/universal-apple-darwin/release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install build deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential pkg-config
+
+      - name: Install build deps (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install cmake
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/kdct-panel/package-lock.json
+
+      - name: Build panel
+        run: |
+          cd apps/kdct-panel
+          npm ci
+          npm run build
+
+      - name: Build (Linux x86_64)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo build --release --target ${{ matrix.target }} --workspace --bins
+
+      - name: Build (macOS universal — x86_64 + aarch64, lipo'd)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build --release --target x86_64-apple-darwin --workspace --bins
+          cargo build --release --target aarch64-apple-darwin --workspace --bins
+          mkdir -p target/universal-apple-darwin/release
+          for bin in kdcts kdctc; do
+            lipo -create \
+              "target/x86_64-apple-darwin/release/${bin}" \
+              "target/aarch64-apple-darwin/release/${bin}" \
+              -output "target/universal-apple-darwin/release/${bin}"
+            lipo -info "target/universal-apple-darwin/release/${bin}"
+          done
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about
+
+      - name: Generate THIRD_PARTY_LICENSES.html
+        run: cargo about generate -c about.toml -o THIRD_PARTY_LICENSES.html about.hbs
+
+      - name: Stage release tarball
+        id: stage
+        run: |
+          set -euo pipefail
+          STAGE="kdct-${{ inputs.tag }}-${{ matrix.name }}"
+          mkdir -p "${STAGE}/panel"
+          cp "${{ matrix.artifact_dir }}/kdcts" "${STAGE}/"
+          cp "${{ matrix.artifact_dir }}/kdctc" "${STAGE}/"
+          cp -R apps/kdct-panel/build/. "${STAGE}/panel/"
+          cp LICENSE NOTICE README.md THIRD_PARTY_LICENSES.html "${STAGE}/"
+          cp server.toml "${STAGE}/server.toml.example"
+          cat > "${STAGE}/INSTALL.txt" <<'EOF'
+          KDCT — installation
+          ===================
+
+          This archive contains:
+            kdcts                  server binary
+            kdctc                  client binary
+            panel/                 SvelteKit static panel served by kdcts
+            server.toml.example    sample server config
+            LICENSE                Apache-2.0 license text
+            NOTICE                 attribution for rathole and Pingora
+            THIRD_PARTY_LICENSES   license texts for all transitive deps
+            README.md              project documentation
+
+          The server looks for the panel in this order:
+            1. $KDCT_PANEL_DIR (env var)
+            2. <directory of kdcts>/panel/  (default — works as-shipped)
+            3. compile-time fallback (only useful for `cargo run`)
+
+          So if you keep `kdcts` and `panel/` in the same directory, it
+          just works. To put them elsewhere, set KDCT_PANEL_DIR.
+
+          Docker must be installed on whatever machine runs kdcts (used
+          for the Docker Hub search / image pre-checks).
+
+          Quick start:
+            cp server.toml.example server.toml
+            $EDITOR server.toml          # set domain, token, ports
+            ./kdcts --config server.toml
+
+          See README.md for the full client + panel walk-through.
+          EOF
+          tar czf "${STAGE}.tar.gz" "${STAGE}"
+          shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          echo "tarball=${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${STAGE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdct-${{ inputs.tag }}-${{ matrix.name }}
+          path: |
+            ${{ steps.stage.outputs.tarball }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          draft: ${{ inputs.draft }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
