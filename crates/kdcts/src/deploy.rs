@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use tunnel::protocol::ControlChannelCmd;
 use tunnel::registry::ClientRegistry;
-use tunnel::server::spawn_port_accept_loop;
+use tunnel::server::{spawn_port_accept_loop, spawn_port_udp_loop};
 use std::sync::Arc;
 use tokio::sync::{broadcast, oneshot, RwLock};
 use tokio::time::{self, Duration};
@@ -153,10 +153,20 @@ pub async fn deploy_connection(
             }
         }
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
-        spawn_port_accept_loop(
-            pool.clone(), server_port, port_map[i].0,
-            data_ch_req_tx.clone(), port_data_callbacks.clone(), shutdown_rx,
-        );
+        let has_udp = p.protocols.as_deref().unwrap_or("").split(',').any(|s| s.trim() == "udp");
+        if has_udp {
+            spawn_port_udp_loop(
+                server_port,
+                data_ch_req_tx.clone(),
+                port_data_callbacks.clone(),
+                shutdown_rx,
+            );
+        } else {
+            spawn_port_accept_loop(
+                pool.clone(), server_port, port_map[i].0,
+                data_ch_req_tx.clone(), port_data_callbacks.clone(), shutdown_rx,
+            );
+        }
         active_forwards.write().await.push((server_port, shutdown_tx));
     }
     drop(table);

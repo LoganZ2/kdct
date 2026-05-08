@@ -718,6 +718,99 @@ pub fn spawn_port_accept_loop(
     );
 }
 
+pub fn spawn_port_udp_loop(
+    server_port: u16,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    port_data_callbacks: Arc<RwLock<VecDeque<(crate::registry::SyncedCallback, u16)>>>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) {
+    tokio::spawn(
+        async move {
+            use tokio::net::TcpStream;
+            let socket = match UdpSocket::bind(format!("0.0.0.0:{}", server_port)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to bind UDP port {}: {:#}", server_port, e);
+                    return;
+                }
+            };
+            info!("UDP port accept loop started on {}", server_port);
+
+            // Request one data channel for UDP traffic
+            if data_ch_req_tx.send(true).is_err() {
+                return;
+            }
+            let (tx, rx) = oneshot::channel::<TcpStream>();
+            let cb: crate::registry::ForwardCallback = Box::new(move |stream: Box<dyn std::any::Any + Send>| {
+                if let Ok(tcp) = stream.downcast::<TcpStream>() {
+                    let _ = tx.send(*tcp);
+                }
+            });
+            let synced = std::sync::Mutex::new(Some(cb));
+            port_data_callbacks.write().await.push_back((synced, server_port));
+
+            let mut conn = match rx.await {
+                Ok(c) => c,
+                Err(_) => {
+                    debug!("UDP data channel request cancelled");
+                    return;
+                }
+            };
+
+            if let Err(e) = protocol::write_data_cmd(&mut conn, &DataChannelCmd::StartForwardUdp).await {
+                error!("Failed to write StartForwardUdp: {:#}", e);
+                return;
+            }
+
+            let (mut rd, mut wr) = io::split(conn);
+            let mut buf = [0u8; UDP_BUFFER_SIZE];
+
+            loop {
+                tokio::select! {
+                    val = socket.recv_from(&mut buf) => {
+                        match val {
+                            Ok((n, from)) => {
+                                if let Err(e) = UdpTraffic::write_slice(&mut wr, from, &buf[..n]).await {
+                                    error!("UDP write error: {:#}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("UDP recv error: {:#}", e);
+                                break;
+                            }
+                        }
+                    }
+                    hdr_len = rd.read_u8() => {
+                        match hdr_len {
+                            Ok(len) => {
+                                match UdpTraffic::read(&mut rd, len).await {
+                                    Ok(t) => {
+                                        let _ = socket.send_to(&t.data, t.from).await;
+                                    }
+                                    Err(e) => {
+                                        error!("UDP read error: {:#}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("UDP read_hdr error: {:#}", e);
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+            info!("UDP port {} accept loop shutdown", server_port);
+        }
+        .instrument(Span::current()),
+    );
+}
+
 fn tcp_listen_and_send(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
