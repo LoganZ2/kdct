@@ -280,7 +280,7 @@ kdct/
 ├── crates/
 │   ├── tunnel/               TCP tunnel + Docker control protocol
 │   │   └── src/{client,server,protocol,registry,port_pool,transport}.rs
-│   ├── kdct-server/          server binary (kdcts)
+│   ├── kdcts/                server binary (kdcts)
 │   │   └── src/{main,api,db,deploy,deployment_tracker,image,proxy}.rs
 │   └── kdctc/                client binary (kdctc)
 │       └── src/{main,docker}.rs

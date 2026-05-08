@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/tunnel",
-    "crates/kdct-server",
+    "crates/kdcts",
     "crates/kdctc",
 ]
 

@@ -324,6 +324,15 @@ impl Database {
         Ok(stmt.query_row(params![bridge_id, container_port], |row| row.get(0)).ok())
     }
 
+    pub fn get_bridge_pool_ports(&self, bridge_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pool_port FROM bridge_ports WHERE bridge_id=?1 AND pool_port IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![bridge_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // ── Bridge envs ───────────────────────────────────────────
 
     pub fn set_bridge_envs(&self, bridge_id: i64, envs: &[(String, String)]) -> Result<()> {

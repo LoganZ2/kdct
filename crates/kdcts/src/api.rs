@@ -183,6 +183,12 @@ pub async fn run_api(
                     let rest = &p["/api/bridges/".len()..];
                     let (id_str, _) = rest.split_once('/').unwrap_or((rest, ""));
                     let bridge_id: i64 = match id_str.parse() { Ok(id) => id, Err(_) => return error_json("Invalid bridge id", 400) };
+                    // Release pool ports before deleting bridge
+                    if let Ok(pool_ports) = db.get_bridge_pool_ports(bridge_id) {
+                        for pp in pool_ports {
+                            handle.block_on(pool.release_by_port(pp as u16));
+                        }
+                    }
                     match db.delete_bridge(bridge_id) {
                         Ok(_) => respond_json(&json!({"ok": true})),
                         Err(e) => error_json(&format!("{}", e), 500),
