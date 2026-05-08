@@ -201,8 +201,6 @@ pub struct ClientConfig {
     pub prefer_ipv6: Option<bool>,
     #[serde(default)]
     pub services: HashMap<String, ClientServiceConfig>,
-    #[serde(default)]
-    pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
@@ -305,8 +303,6 @@ impl Config {
             }
         }
 
-        Config::validate_transport_config(&server.transport, true)?;
-
         Ok(())
     }
 
@@ -321,8 +317,6 @@ impl Config {
                 s.retry_interval = Some(client.retry_interval);
             }
         }
-
-        Config::validate_transport_config(&client.transport, false)?;
 
         Ok(())
     }

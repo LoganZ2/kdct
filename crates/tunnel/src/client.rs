@@ -1,4 +1,4 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
+use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TcpConfig, TransportConfig, TransportType};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -96,12 +96,8 @@ pub async fn run_client(
     )
     })?;
 
-    match config.transport.transport_type {
-        TransportType::Tcp => {
-            let mut client = Client::<TcpTransport>::from(config).await?;
-            client.run(shutdown_rx).await
-        }
-    }
+    let mut client = Client::<TcpTransport>::from(config).await?;
+    client.run(shutdown_rx).await
 }
 
 type ServiceDigest = protocol::Digest;
@@ -115,8 +111,9 @@ pub struct Client<T: Transport> {
 
 impl<T: 'static + Transport> Client<T> {
     pub async fn from(config: ClientConfig) -> Result<Client<T>> {
+        let transport_cfg = TransportConfig { transport_type: TransportType::Tcp, tcp: TcpConfig::default() };
         let transport =
-            Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
+            Arc::new(T::new(&transport_cfg).with_context(|| "Failed to create the transport")?);
         Ok(Client {
             config,
             service_handles: HashMap::new(),

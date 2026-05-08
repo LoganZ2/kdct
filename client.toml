@@ -7,6 +7,3 @@ type = "tcp"
 local_addr = "127.0.0.1:3000"
 port_range_start = 3000
 port_range_end = 3999
-
-[client.transport]
-type = "tcp"

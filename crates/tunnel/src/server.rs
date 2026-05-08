@@ -1,4 +1,4 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
+use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TcpConfig, TransportConfig, TransportType};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
 use crate::helper::retry_notify_with_deadline;
 use crate::multi_map::MultiMap;
@@ -42,13 +42,9 @@ pub async fn run_server(
             }
         };
 
-    match config.transport.transport_type {
-        TransportType::Tcp => {
-            let (node_update_tx, _) = mpsc::channel(1024);
-            let mut server = Server::<TcpTransport>::from(config, None, node_update_tx).await?;
-            server.run(shutdown_rx).await?;
-        }
-    }
+    let (node_update_tx, _) = mpsc::channel(1024);
+    let mut server = Server::<TcpTransport>::from(config, None, node_update_tx).await?;
+    server.run(shutdown_rx).await?;
 
     Ok(())
 }
@@ -84,7 +80,8 @@ impl<T: 'static + Transport> Server<T> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
-        let transport = Arc::new(T::new(&config.transport)?);
+        let transport_cfg = TransportConfig { transport_type: TransportType::Tcp, tcp: TcpConfig::default() };
+        let transport = Arc::new(T::new(&transport_cfg)?);
         let clients = registry::new_registry();
         Ok(Server {
             config,
