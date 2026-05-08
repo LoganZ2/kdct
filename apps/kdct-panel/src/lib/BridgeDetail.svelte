@@ -32,6 +32,10 @@
   async function addPort() {
     const portNum = parseInt(portContainerPort);
     if (!portNum) { portMsg = 'Enter a port number'; return; }
+    if (detail?.ports?.some((p: any) => p.container_port === portNum)) {
+      portMsg = 'This container port is already defined for this bridge';
+      return;
+    }
     if (portMode === 'route') {
       if (!portRoutePath.startsWith('/')) { portMsg = 'Path must start with /'; return; }
       if (portRoutePath === '/admin' || portRoutePath.startsWith('/admin/')) {

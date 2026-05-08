@@ -88,6 +88,7 @@ impl Database {
                 route_path TEXT,
                 protocols TEXT,
                 pool_port INTEGER,
+                UNIQUE(bridge_id, container_port),
                 FOREIGN KEY (bridge_id) REFERENCES bridges(id) ON DELETE CASCADE
             );
 
