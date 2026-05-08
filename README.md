@@ -169,7 +169,7 @@ kdct/
 
 ## Caveats
 
-- **Panel has no built-in auth.** Anyone who can reach `/admin/` can deploy. Front the proxy with basic auth, a VPN, or an SSH tunnel.
+- **Panel has optional basic auth.** Set `admin_user` and `admin_password` in `server.toml` to protect `/admin/` with HTTP Basic Authentication. Not required, but recommended for production.
 - **Hostname collision.** Nodes are keyed by SHA-256 auth digest, but the registry also indexes by hostname. Two clients sharing a hostname currently collide.
 - **No HTTP→HTTPS redirect.** TLS-on means HTTP is gone; if you want both, terminate elsewhere.
 
