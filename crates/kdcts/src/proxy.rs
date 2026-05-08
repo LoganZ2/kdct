@@ -66,7 +66,9 @@ impl RouteTable {
 
 pub struct KdctProxy {
     pub route_table: Arc<RwLock<RouteTable>>,
-    pub domain: String,
+    /// Public hostname to enforce on the Host header. `None` means accept
+    /// any Host (nginx default_server behavior — useful for IP-only setups).
+    pub domain: Option<String>,
     pub api_port: u16,
 }
 
@@ -96,10 +98,17 @@ impl ProxyHttp for KdctProxy {
         };
         let path = header.uri.path();
 
-        if host != self.domain {
-            warn!("Rejected request for unknown host: {}", host);
-            return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+        if let Some(expected) = &self.domain {
+            if host != *expected {
+                warn!("Rejected request for unknown host: {}", host);
+                return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)));
+            }
         }
+
+        // SNI/authority for the upstream connection. We always speak plain
+        // HTTP to the local tunnel endpoint, so the value is unused — just
+        // pick something stable.
+        let upstream_sni = self.domain.clone().unwrap_or_else(|| host.clone());
 
         // Reserved /admin prefix → forward to the panel API
         if is_admin_path(path) {
@@ -107,7 +116,7 @@ impl ProxyHttp for KdctProxy {
             let peer = Box::new(HttpPeer::new(
                 ("127.0.0.1", self.api_port),
                 false,
-                self.domain.clone(),
+                upstream_sni,
             ));
             return Ok(peer);
         }
@@ -122,7 +131,7 @@ impl ProxyHttp for KdctProxy {
         let peer = Box::new(HttpPeer::new(
             ("127.0.0.1", port),
             false,
-            self.domain.clone(),
+            upstream_sni,
         ));
         Ok(peer)
     }
@@ -136,7 +145,7 @@ pub struct TlsConfig {
 
 pub async fn run_proxy(
     route_table: Arc<RwLock<RouteTable>>,
-    domain: String,
+    domain: Option<String>,
     api_port: u16,
     http_port: u16,
     https_port: u16,
@@ -168,7 +177,13 @@ pub async fn run_proxy(
         }
     };
 
-    info!("Pingora proxy listening on {} for domain {}", listen_summary, domain);
+    match &domain {
+        Some(d) => info!("Pingora proxy listening on {} for domain {}", listen_summary, d),
+        None => info!(
+            "Pingora proxy listening on {} (no domain configured — accepting any Host)",
+            listen_summary
+        ),
+    }
 
     my_server.add_service(service);
 

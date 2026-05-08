@@ -74,13 +74,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         .server
         .ok_or_else(|| anyhow::anyhow!("Missing [server] section in config"))?;
 
-    let domain = server_config
-        .domain
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!(
-            "Domain is required. Set `domain = \"example.com\"` in [server] config."
-        ))?
-        .clone();
+    // Domain is optional. When unset, the proxy accepts any Host header
+    // (like nginx with no `server_name`), so users can hit kdcts directly
+    // by IP. TLS is force-disabled in that mode because there's no name
+    // to put on a cert.
+    let domain = server_config.domain.as_ref().cloned();
 
     let http_port = server_config.http_port;
     let https_port = server_config.https_port;
@@ -89,8 +87,10 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     let db = Database::open(&db_path)?;
 
-    // Resolve TLS configuration: persisted toggle in DB + cert/key paths from config.
-    let tls_configurable = match (
+    // Resolve TLS configuration: persisted toggle in DB + cert/key paths from
+    // config. TLS additionally requires a configured `domain` — without one,
+    // there's no name to bind a certificate to.
+    let tls_paths_ok = match (
         server_config.tls_cert_path.as_deref(),
         server_config.tls_key_path.as_deref(),
     ) {
@@ -99,6 +99,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         }
         _ => false,
     };
+    let tls_configurable = domain.is_some() && tls_paths_ok;
     let tls_persisted = db
         .get_setting("tls_enabled")
         .ok()
@@ -129,7 +130,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     // Mark all nodes offline on startup (they'll come back online when they reconnect)
     db.mark_all_offline()?;
 
-    tracing::info!("Starting KDCT server with domain: {}", domain);
+    match &domain {
+        Some(d) => tracing::info!("Starting KDCT server with domain: {}", d),
+        None => tracing::info!(
+            "Starting KDCT server without a domain — proxy will accept any Host (TLS disabled)"
+        ),
+    }
 
     match server_config.transport.transport_type {
         TransportType::Tcp => {
@@ -238,6 +244,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let api_settings = api::ApiSettings {
                 live_tls_enabled: tls_live,
                 tls_configurable,
+                domain_configured: domain.is_some(),
                 http_port,
                 https_port,
                 api_port,

@@ -41,7 +41,7 @@
 bind_addr     = "0.0.0.0:2333"           # tunnel listener
 default_token = "change-me"
 port_pool     = "9000-9999"              # tunnel ports, pre-bound at start
-domain        = "app.example.com"        # required
+domain        = "app.example.com"        # optional — leave unset for IP-only setups
 
 http_port  = 80                          # used when TLS is OFF
 https_port = 443                         # used when TLS is ON
@@ -109,9 +109,16 @@ KDCT splits a deployment into three reusable pieces, joined by a connection:
 4. Pingora's `upstream_peer` does longest-prefix matching on the route table and forwards through the tunnel to the client.
 5. On disconnect the routes drop but the bridge keeps its pool ports; reconnect and the auto-check loop redeploys. The client keeps containers and images warm for `image_cache_ttl_seconds`.
 
+## Domain
+
+`domain` is optional.
+
+- **Set:** the proxy enforces it on the `Host` header — anything else gets a 404, same as nginx with `server_name`. Required for TLS.
+- **Unset:** the proxy accepts any `Host`, so you can hit `kdcts` directly by public IP — same behavior as nginx without a `server_name`. The panel lives at `http://<your-ip>/admin/`. TLS is locked off in this mode.
+
 ## TLS
 
-If `tls_cert_path` and `tls_key_path` point at a real cert and key, the **TLS toggle** in the panel's settings becomes available. Flip it on, restart `kdcts`, done. Pingora binds either `http_port` or `https_port`, never both — there's no mixed-mode and no auto-redirect. Front with Caddy/nginx if you need one.
+Requires `domain` plus `tls_cert_path` and `tls_key_path` pointing at a real cert and key. When all three are present, the **TLS toggle** in the panel's settings becomes available. Flip it on, restart `kdcts`, done. Pingora binds either `http_port` or `https_port`, never both — there's no mixed-mode and no auto-redirect. Front with Caddy/nginx if you need one.
 
 No ACME / Let's Encrypt automation; bring your own cert.
 

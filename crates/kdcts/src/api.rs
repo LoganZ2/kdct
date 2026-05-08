@@ -24,8 +24,12 @@ type Resp = tiny_http::Response<Cursor<Vec<u8>>>;
 pub struct ApiSettings {
     /// Whether the running Pingora task is currently using TLS.
     pub live_tls_enabled: bool,
-    /// True if the server config supplied both a cert and a key path.
+    /// True iff a domain is set AND both cert and key paths point at real
+    /// files. The UI uses this to enable/disable the TLS toggle.
     pub tls_configurable: bool,
+    /// Whether `domain` is set in server.toml. Lets the UI explain *why*
+    /// TLS is unavailable when it is.
+    pub domain_configured: bool,
     /// Public HTTP port (used when TLS is off).
     pub http_port: u16,
     /// Public HTTPS port (used when TLS is on).
@@ -431,6 +435,7 @@ pub async fn run_api(
                         "tls_enabled": persisted_tls,
                         "live_tls_enabled": settings.live_tls_enabled,
                         "tls_configurable": settings.tls_configurable,
+                        "domain_configured": settings.domain_configured,
                         "restart_required": persisted_tls != settings.live_tls_enabled,
                         "http_port": settings.http_port,
                         "https_port": settings.https_port,
@@ -452,10 +457,14 @@ pub async fn run_api(
                         None => return error_json("Missing 'tls_enabled' boolean", 400),
                     };
                     if want_tls && !settings.tls_configurable {
-                        return error_json(
-                            "Cannot enable TLS: tls_cert_path / tls_key_path not set in server.toml",
-                            400,
-                        );
+                        let msg = if !settings.domain_configured {
+                            "Cannot enable TLS: no `domain` set in server.toml. \
+                             Add a domain (and a matching cert/key) to use HTTPS."
+                        } else {
+                            "Cannot enable TLS: tls_cert_path / tls_key_path \
+                             not set or not pointing at real files in server.toml"
+                        };
+                        return error_json(msg, 400);
                     }
                     let value = if want_tls { "true" } else { "false" };
                     match db.set_setting("tls_enabled", value) {
