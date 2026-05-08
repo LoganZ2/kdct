@@ -50,8 +50,8 @@ api_port   = 9933                        # panel + REST API, 127.0.0.1 only
 # tls_cert_path = "/etc/kdct/cert.pem"   # uncomment to enable TLS toggle
 # tls_key_path  = "/etc/kdct/key.pem"
 
-[server.transport]
-type = "tcp"
+# admin_user     = "admin"                # optional basic auth for /admin
+# admin_password = "s3cret"
 ```
 
 ```bash
@@ -74,9 +74,6 @@ local_addr       = "127.0.0.1:3000"
 port_range_start = 3000                  # required
 port_range_end   = 3999                  # required
 # image_cache_ttl_seconds = 300          # default 5 min
-
-[client.transport]
-type = "tcp"
 ```
 
 ```bash
