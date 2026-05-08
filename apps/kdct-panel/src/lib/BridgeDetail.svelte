@@ -99,13 +99,19 @@
   <div class="section-head" style="margin-bottom:8px"><h3>Ports</h3></div>
   {#if detail?.ports?.length}
     <table style="margin-bottom:8px">
-      <thead><tr><th>Container Port</th><th>Mode</th><th>Route Path</th><th>Protocols</th><th></th></tr></thead>
+      <thead><tr><th>Container Port</th><th>Mode</th><th>Path / Port</th><th>Protocols</th><th></th></tr></thead>
       <tbody>
         {#each detail.ports as p}
           <tr>
             <td class="hi">{p.container_port}</td>
             <td>{#if p.mode === 'direct'}<span class="badge direct">direct</span>{:else}<span class="badge route">route</span>{/if}</td>
-            <td class="dim">{p.mode === 'route' ? (p.route_path || '-') : '-'}</td>
+            <td class="dim">
+              {#if p.mode === 'route'}
+                {p.route_path || '-'}
+              {:else}
+                {p.pool_port != null ? ':' + p.pool_port : '—'}
+              {/if}
+            </td>
             <td class="dim">{p.mode === 'direct' ? (p.protocols || 'tcp') : 'http'}</td>
             <td><button class="ghost danger" onclick={() => deletePort(p.container_port)}>×</button></td>
           </tr>
