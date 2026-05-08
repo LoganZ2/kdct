@@ -259,7 +259,11 @@
             <div class="dim" style="font-size:11px">
               Public reverse proxy is currently {settings.live_tls_enabled ? `serving HTTPS on :${settings.https_port}` : `serving HTTP on :${settings.http_port}`}.
               {#if !settings.tls_configurable}
-                <br>To enable TLS, set <code>tls_cert_path</code> and <code>tls_key_path</code> in <code>server.toml</code>.
+                {#if settings.domain_configured === false}
+                  <br>To enable TLS, set <code>domain</code> (and matching <code>tls_cert_path</code> / <code>tls_key_path</code>) in <code>server.toml</code>.
+                {:else}
+                  <br>To enable TLS, set <code>tls_cert_path</code> and <code>tls_key_path</code> in <code>server.toml</code>.
+                {/if}
               {/if}
             </div>
           </div>
