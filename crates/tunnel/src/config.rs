@@ -261,6 +261,13 @@ pub struct ServerConfig {
     /// Path to a PEM-encoded TLS private key. Required when TLS is toggled on.
     #[serde(default)]
     pub tls_key_path: Option<String>,
+    /// Admin panel basic auth username (optional). When both username and password
+    /// are set, /admin requires HTTP Basic Authentication.
+    #[serde(default)]
+    pub admin_user: Option<String>,
+    /// Admin panel basic auth password (optional). Ignored unless admin_user is also set.
+    #[serde(default)]
+    pub admin_password: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

@@ -32,6 +32,10 @@ pub struct ApiSettings {
     pub https_port: u16,
     /// Internal panel/API port.
     pub api_port: u16,
+    /// Admin basic auth username (optional).
+    pub admin_user: Option<String>,
+    /// Admin basic auth password (optional).
+    pub admin_password: Option<String>,
 }
 
 #[derive(Clone)]
@@ -107,6 +111,17 @@ pub async fn run_api(
                 raw_path_no_query.clone()
             };
             let handle = Handle::current();
+
+            // Basic auth check (when configured)
+            if let (Some(ref user), Some(ref pass)) = (&settings.admin_user, &settings.admin_password) {
+                if !check_basic_auth(&request, user, pass) {
+                    let resp = tiny_http::Response::from_string("Unauthorized")
+                        .with_status_code(tiny_http::StatusCode(401))
+                        .with_header(tiny_http::Header::from_bytes("WWW-Authenticate", "Basic realm=\"KDCT\"").unwrap());
+                    if let Err(e) = request.respond(resp) { error!("Failed to send 401: {}", e); }
+                    continue;
+                }
+            }
 
             let response = match (method, path.as_str()) {
                 // ── Nodes ────────────────────────────────────────
@@ -751,4 +766,29 @@ fn fetch_tags(repo: &str, page: u32) -> Result<serde_json::Value> {
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string())).collect();
     let has_next = parsed["next"].is_string();
     Ok(json!({ "tags": tags, "has_next": has_next }))
+}
+
+fn check_basic_auth(request: &tiny_http::Request, user: &str, pass: &str) -> bool {
+    let auth_header = match request.headers().iter()
+        .find(|h| h.field.equiv("Authorization"))
+    {
+        Some(h) => h.value.as_str(),
+        None => return false,
+    };
+    let encoded = match auth_header.strip_prefix("Basic ") {
+        Some(e) => e.trim(),
+        None => return false,
+    };
+    let decoded = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let credentials = match std::str::from_utf8(&decoded) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut parts = credentials.splitn(2, ':');
+    let got_user = parts.next().unwrap_or("");
+    let got_pass = parts.next().unwrap_or("");
+    got_user == user && got_pass == pass
 }

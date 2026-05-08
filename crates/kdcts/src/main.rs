@@ -241,6 +241,8 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 http_port,
                 https_port,
                 api_port,
+                admin_user: server_config.admin_user.clone(),
+                admin_password: server_config.admin_password.clone(),
             };
             tokio::spawn(async move {
                 if let Err(e) = api::run_api(

@@ -23,8 +23,6 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
-const DEFAULT_IMAGE_CACHE_TTL_SECS: u64 = 300;
-
 #[derive(Debug, Clone)]
 struct TrackedContainer {
     container_name: String,
@@ -79,11 +77,6 @@ impl ImageCache {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64);
-        self.save();
-    }
-
-    fn remove(&mut self, image: &str) {
-        self.entries.remove(image);
         self.save();
     }
 
