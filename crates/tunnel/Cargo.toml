@@ -16,22 +16,22 @@ client = []
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = { version = "1", features = ["serde"] }
-clap = { version = "3.0", features = ["derive"] }
-toml = "0.5"
+clap = { version = "4.6", features = ["derive"] }
+toml = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 bincode = "1"
 hex = "0.4"
-rand = "0.8"
+rand = "0.10"
 backoff = { version = "0.4", features = ["tokio"] }
 tracing = "0.1"
-socket2 = { version = "0.4", features = ["all"] }
-fdlimit = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
+fdlimit = "0.3"
 async-trait = "0.1"
 async-http-proxy = { version = "1.2", features = [
     "runtime-tokio",
     "basic-auth",
 ] }
-async-socks5 = "0.5"
-url = { version = "2.2", features = ["serde"] }
+async-socks5 = "0.6"
+url = { version = "2.5", features = ["serde"] }

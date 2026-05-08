@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
-use rand::RngCore;
+use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -215,7 +215,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     T::hint(&conn, SocketOpts::for_control_channel());
 
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
 
     let hello_send = Hello::ControlChannelHello(
         protocol::CURRENT_PROTO_VERSION,
