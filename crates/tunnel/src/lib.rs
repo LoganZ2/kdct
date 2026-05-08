@@ -1,3 +1,10 @@
+// This crate is a modified derivative of rathole
+// (https://github.com/rapiz1/rathole), Copyright (c) rapiz1 and
+// rathole contributors, originally licensed under the Apache
+// License, Version 2.0. Modifications Copyright 2026 LoganZ2,
+// distributed under the same license. See ../../NOTICE and
+// ../../LICENSE at the repository root for details.
+
 pub mod cli;
 pub mod config;
 pub mod constants;

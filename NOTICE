@@ -1,0 +1,49 @@
+KDCT
+Copyright 2026 LoganZ2
+
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE file at the root of this repository).
+
+================================================================
+Third-party software included in this product
+================================================================
+
+----------------------------------------------------------------
+crates/tunnel/ — derived from rathole
+----------------------------------------------------------------
+
+This crate is a modified derivative of rathole.
+
+  Project:    rathole
+  Source:     https://github.com/rapiz1/rathole
+  Copyright:  Copyright (c) rapiz1 and rathole contributors
+  License:    Apache License, Version 2.0
+
+Modifications by LoganZ2 are tracked in the git history of this
+repository (https://github.com/LoganZ2/kdct). Notable changes
+include the Docker control protocol (ImageStart / ImageStop /
+ContainerStarted / etc.), node status reporting, the pre-bound
+port pool, and removal of the noise transport.
+
+----------------------------------------------------------------
+Pingora (Cargo dependency, statically linked into kdcts)
+----------------------------------------------------------------
+
+  Project:    Pingora
+  Source:     https://github.com/cloudflare/pingora
+  Copyright:  Copyright 2024 Cloudflare, Inc.
+  License:    Apache License, Version 2.0
+
+----------------------------------------------------------------
+
+A complete list of transitive dependencies and their licenses can
+be generated from the Cargo metadata, e.g. via:
+
+    cargo install cargo-about
+    cargo about generate -o THIRD_PARTY_LICENSES.html
+
+The trade names, trademarks, and product names of the third-party
+projects above (including but not limited to "rathole",
+"Pingora", and "Cloudflare") are the property of their respective
+owners and are used here only for descriptive attribution as
+permitted by Section 6 of the Apache License, Version 2.0.
