@@ -93,11 +93,9 @@ jobs:
       - name: Generate THIRD_PARTY_LICENSES.html
         run: |
           set -euo pipefail
-          echo "Installing cargo-about..."
-          cargo install --locked cargo-about
-          echo "Generating license report..."
+          cargo install --locked cargo-about --features cli
           cargo about generate -c about.toml -o THIRD_PARTY_LICENSES.html about.hbs
-          echo "Done: $(wc -c < THIRD_PARTY_LICENSES.html) bytes"
+          echo "THIRD_PARTY_LICENSES.html: $(wc -c < THIRD_PARTY_LICENSES.html) bytes"
 
       - name: Stage release tarball
         id: stage

@@ -23,13 +23,10 @@ accepted = [
     "MPL-2.0",
     "OpenSSL",
     "BSL-1.0",
+    "CDLA-Permissive-2.0",
 ]
 
 # Don't fail on crates that we can't determine a license for —
 # warn instead. Tighten to `false` once the audit is clean.
-[crates]
-# (per-crate clarifications go here if needed)
-
-[licenses]
-# Allow license clarifications for individual crates that misdeclare.
-# (none yet)
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
