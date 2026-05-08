@@ -49,7 +49,7 @@ pub enum TransportType {
 
 /// Per service config
 /// All Option are optional in configuration but must be Some value in runtime
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientServiceConfig {
     #[serde(rename = "type", default = "default_service_type")]
@@ -62,16 +62,36 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
-    /// Client-side Docker port range start (default 3000)
-    #[serde(default = "default_port_start")]
+    /// Client-side Docker port range start (required, e.g. 3000).
     pub port_range_start: u16,
-    /// Client-side Docker port range end (default 3999)
-    #[serde(default = "default_port_end")]
+    /// Client-side Docker port range end (required, e.g. 3999).
     pub port_range_end: u16,
+    /// Image/container cache TTL in seconds (default 300 = 5 min).
+    /// After disconnection, containers and pulled images are kept for
+    /// this long so they can be reused on quick reconnect.  After the
+    /// TTL expires, containers are stopped, removed, and images pruned.
+    #[serde(default = "default_image_cache_ttl")]
+    pub image_cache_ttl_seconds: u64,
 }
 
-fn default_port_start() -> u16 { 3000 }
-fn default_port_end() -> u16 { 3999 }
+fn default_image_cache_ttl() -> u64 { 300 }
+
+impl Default for ClientServiceConfig {
+    fn default() -> Self {
+        ClientServiceConfig {
+            service_type: ServiceType::Tcp,
+            name: String::new(),
+            local_addr: String::new(),
+            prefer_ipv6: false,
+            token: None,
+            nodelay: None,
+            retry_interval: None,
+            port_range_start: 0,
+            port_range_end: 0,
+            image_cache_ttl_seconds: 300,
+        }
+    }
+}
 
 impl ClientServiceConfig {
     pub fn with_name(name: &str) -> ClientServiceConfig {

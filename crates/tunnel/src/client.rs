@@ -13,7 +13,8 @@ use backoff::ExponentialBackoff;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::io::{self, copy_bidirectional, AsyncReadExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
@@ -21,6 +22,76 @@ use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
+
+const DEFAULT_IMAGE_CACHE_TTL_SECS: u64 = 300;
+
+#[derive(Debug, Clone)]
+struct TrackedContainer {
+    container_name: String,
+    image_tag: String,
+}
+
+struct ImageCache {
+    entries: HashMap<String, i64>,
+}
+
+impl ImageCache {
+    fn path() -> PathBuf {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".kdct").join("image_cache.txt")
+    }
+
+    fn load() -> Self {
+        let entries = match std::fs::read_to_string(Self::path()) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(2, '|');
+                    let image = parts.next()?.to_string();
+                    let ts: i64 = parts.next()?.parse().ok()?;
+                    Some((image, ts))
+                })
+                .collect(),
+            Err(_) => HashMap::new(),
+        };
+        Self { entries }
+    }
+
+    fn save(&self) {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content: String = self
+            .entries
+            .iter()
+            .map(|(k, v)| format!("{}|{}", k, v))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(&path, content);
+    }
+
+    fn record(&mut self, image: &str) {
+        self.entries
+            .insert(image.to_string(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64);
+        self.save();
+    }
+
+    fn remove(&mut self, image: &str) {
+        self.entries.remove(image);
+        self.save();
+    }
+
+    fn clear_expired(&mut self, _ttl_secs: i64) {
+        self.entries.clear();
+        self.save();
+    }
+}
 
 pub async fn run_client(
     config: Config,
@@ -64,26 +135,16 @@ impl<T: 'static + Transport> Client<T> {
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
     ) -> Result<()> {
-        let services: Vec<(String, ClientServiceConfig)> = if self.config.services.is_empty() {
-            let hostname = get_hostname();
-            let service = ClientServiceConfig {
-                service_type: ServiceType::Tcp,
-                name: hostname.clone(),
-                local_addr: "127.0.0.1:3000".into(),
-                token: None,
-                prefer_ipv6: false,
-                nodelay: None,
-                retry_interval: None,
-                port_range_start: 3000,
-                port_range_end: 3999,
-            };
-            vec![(hostname, service)]
-        } else {
-            self.config.services
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
+        let services: Vec<(String, ClientServiceConfig)> = self.config.services
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if services.is_empty() {
+            return Err(anyhow!(
+                "No services configured in [client.services]. Please add at least one service with port_range_start and port_range_end."
+            ));
+        }
 
         for (name, config) in &services {
             let handle = ControlChannelHandle::new(
@@ -312,6 +373,10 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,
     transport: Arc<T>,
     heartbeat_timeout: u64,
+    /// Tracked containers (survives across reconnections)
+    containers: Arc<Mutex<Vec<TrackedContainer>>>,
+    /// Image pull cache
+    image_cache: Arc<Mutex<ImageCache>>,
 }
 
 pub struct ControlChannelHandle {
@@ -454,9 +519,14 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         }
                         ControlChannelCmd::DockerRun { image_tag, container_name, port_map, env } => {
                             let wr = wr.clone();
+                            let containers = self.containers.clone();
                             tokio::spawn(async move {
-                                match docker_run(&image_tag, &container_name, &port_map, &env).await {
+                                match docker_run_managed(&image_tag, &container_name, &port_map, &env).await {
                                     Ok(ports) => {
+                                        containers.lock().unwrap().push(TrackedContainer {
+                                            container_name: container_name.clone(),
+                                            image_tag: image_tag.clone(),
+                                        });
                                         let mut guard = wr.lock().await;
                                         let _ = protocol::write_control_cmd(&mut *guard, &ControlChannelCmd::ContainerStarted {
                                             container_name: container_name.clone(),
@@ -475,9 +545,11 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         }
                         ControlChannelCmd::DockerStop { container_name } => {
                             let wr = wr.clone();
+                            let containers = self.containers.clone();
                             tokio::spawn(async move {
                                 match docker_stop(&container_name).await {
                                     Ok(()) => {
+                                        containers.lock().unwrap().retain(|c| c.container_name != container_name);
                                         let mut guard = wr.lock().await;
                                         let _ = protocol::write_control_cmd(&mut *guard, &ControlChannelCmd::ContainerStopped {
                                             container_name: container_name.clone(),
@@ -532,7 +604,15 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let containers: Arc<Mutex<Vec<TrackedContainer>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let image_cache: Arc<Mutex<ImageCache>> =
+            Arc::new(Mutex::new(ImageCache::load()));
+
+        let retry_interval = service.retry_interval;
+        let cache_ttl = service.image_cache_ttl_seconds;
+
+        let mut retry_backoff = run_control_chan_backoff(retry_interval.unwrap());
 
         let mut s = ControlChannel {
             digest,
@@ -541,17 +621,44 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            containers: containers.clone(),
+            image_cache: image_cache.clone(),
         };
 
         tokio::spawn(
             async move {
                 let mut start = Instant::now();
+                let mut disconnected_at: Option<Instant> = None;
+                let mut cleanup_done = false;
+                let ttl = Duration::from_secs(cache_ttl);
 
                 while let Err(err) = s
                     .run()
                     .await
                     .with_context(|| "Failed to run the control channel")
                 {
+                    if disconnected_at.is_none() {
+                        disconnected_at = Some(Instant::now());
+                        info!("Control channel disconnected, cache TTL = {}s", cache_ttl);
+                    }
+
+                    if !cleanup_done {
+                        if let Some(dt) = disconnected_at {
+                            if dt.elapsed() > ttl {
+                                info!("Cache TTL expired, cleaning up containers and images");
+                                let tracked: Vec<TrackedContainer> =
+                                    s.containers.lock().unwrap().drain(..).collect();
+                                for c in &tracked {
+                                    warn!("TTL expired — stopping orphan container {}", c.container_name);
+                                    let _ = docker_stop(&c.container_name).await;
+                                    let _ = docker_rmi(&c.image_tag).await;
+                                }
+                                s.image_cache.lock().unwrap().clear_expired(ttl.as_secs() as i64);
+                                cleanup_done = true;
+                            }
+                        }
+                    }
+
                     if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
                         break;
                     }
@@ -749,6 +856,60 @@ async fn docker_build_from_git(git_url: &str, branch: &str, image_tag: &str) -> 
     }
 }
 
+async fn docker_run_managed(
+    image_tag: &str,
+    container_name: &str,
+    port_map: &[(u16, u16)],
+    env: &[(String, String)],
+) -> Result<Vec<u16>> {
+    use tokio::process::Command;
+
+    // Remove existing container with the same name so deploy always starts clean
+    if docker_container_exists(container_name).await {
+        info!("Container '{}' already exists, removing for clean deploy", container_name);
+        let _ = Command::new("docker").args(["stop", container_name]).status().await;
+        let _ = Command::new("docker").args(["rm", "-f", container_name]).status().await;
+    }
+
+    // Auto-pull if image not found locally
+    if !docker_image_exists(image_tag).await {
+        info!("Image '{}' not found locally, pulling...", image_tag);
+        docker_pull(image_tag).await?;
+        image_cache_record(image_tag);
+    }
+
+    docker_run(image_tag, container_name, port_map, env).await
+}
+
+fn image_cache_record(image: &str) {
+    let mut cache = ImageCache::load();
+    cache.record(image);
+}
+
+async fn docker_image_exists(image: &str) -> bool {
+    use tokio::process::Command;
+    let output = Command::new("docker")
+        .args(["images", "-q", image])
+        .output()
+        .await;
+    match output {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+async fn docker_container_exists(container_name: &str) -> bool {
+    use tokio::process::Command;
+    let output = Command::new("docker")
+        .args(["ps", "-a", "-q", "-f", &format!("name=^{}$", container_name)])
+        .output()
+        .await;
+    match output {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
 async fn docker_run(
     image_tag: &str,
     container_name: &str,
@@ -795,5 +956,21 @@ async fn docker_stop(container_name: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow::anyhow!("docker stop failed for {}", container_name))
+    }
+}
+
+async fn docker_rmi(image: &str) -> Result<()> {
+    use tokio::process::Command;
+    info!("Removing image: {}", image);
+    let status = Command::new("docker")
+        .args(["rmi", image])
+        .status()
+        .await
+        .with_context(|| format!("docker rmi failed for {}", image))?;
+    if status.success() {
+        info!("Image removed: {}", image);
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("docker rmi failed for {}", image))
     }
 }
