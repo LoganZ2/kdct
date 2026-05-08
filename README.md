@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/rust-1.75+-orange.svg" alt="Rust 1.75+">
+  <img src="https://img.shields.io/badge/rust-1.85+-orange.svg" alt="Rust 1.85+">
   <img src="https://img.shields.io/badge/proxy-pingora-blue.svg" alt="Pingora">
   <img src="https://img.shields.io/badge/ui-svelte_5-ff3e00.svg" alt="Svelte 5">
   <img src="https://img.shields.io/badge/license-Apache--2.0-red.svg" alt="Apache 2.0">

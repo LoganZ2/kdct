@@ -113,7 +113,7 @@ pub async fn run_api(
             let handle = Handle::current();
 
             // Basic auth check (when configured)
-            if let (Some(ref user), Some(ref pass)) = (&settings.admin_user, &settings.admin_password) {
+            if let (Some(user), Some(pass)) = (&settings.admin_user, &settings.admin_password) {
                 if !check_basic_auth(&request, user, pass) {
                     let resp = tiny_http::Response::from_string("Unauthorized")
                         .with_status_code(tiny_http::StatusCode(401))
