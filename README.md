@@ -37,9 +37,9 @@ Under the hood: a custom TCP tunnel (rathole-derived) + HTTP reverse proxy (Ping
 The web panel (`apps/kdct-panel`) is the primary UI: load images, configure port→path bridges, wire up connections, watch nodes, toggle TLS — no CLI subcommands beyond `kdcts` / `kdctc` themselves. The panel is reachable two ways:
 
 - **Public**: `http(s)://<domain>/admin/` — forwarded by Pingora to the internal API port.
-- **Local**: `http://127.0.0.1:<api_port>/` — bound to loopback only, redirects `/` → `/admin/`.
+- **Local**: `http://127.0.0.1:<api_port>/admin/` — bound to loopback only.
 
-The `/admin` path is reserved — bridges cannot use it as a route path.
+The `/admin` path is reserved — bridges cannot use it as a route path. The bare `/` on the public domain is free for bridges to claim.
 
 ---
 
@@ -109,8 +109,9 @@ default_token = "your-secret"
 [client.services.my-node]
 type = "tcp"
 local_addr = "127.0.0.1:3000"
-port_range_start = 3000
-port_range_end = 3999
+port_range_start = 3000           # required, no default
+port_range_end = 3999             # required, no default
+# image_cache_ttl_seconds = 300   # optional, default 5 min
 
 [client.transport]
 type = "tcp"
@@ -120,7 +121,7 @@ type = "tcp"
 ./kdctc --config client.toml
 ```
 
-The client reports hostname, OS, arch, Docker version, port range, CPU cores, memory. Docker must be installed.
+The client reports hostname, OS, arch, Docker version, port range, CPU cores, memory. Docker must be installed. On disconnect, the client keeps containers and pulled images around for `image_cache_ttl_seconds` so a quick reconnect can reuse them — only after the TTL elapses are the containers stopped and the images pruned.
 
 ### 3. Deploy via the panel
 
@@ -234,15 +235,18 @@ type = "tcp"
 
 ## How It Works
 
-1. Client connects → reports `ReportNodeStatus { hostname, os, arch, docker_version, port_range, cpu, mem, running_containers }` → upserted into SQLite (`client_nodes`)
-2. User loads an image via the panel — server records it (Git sources are shallow-cloned to verify a Dockerfile exists; the actual `docker build` runs on the client at deploy time)
-3. User creates a bridge — port → route_path mappings + env vars stored in `bridge_ports` / `bridge_envs`
-4. User creates a connection (image + bridge + node). Server verifies the node is online, the bridge has ports, the pool has free ports, and no route paths conflict
-5. Server assigns one server-side port per bridge port from the pool, sends `DockerBuild` (for Git images) then `DockerRun` over the control channel, waits for `ContainerStarted`
-6. Server registers each `route` port in `RouteTable` (`/api` → `127.0.0.1:9001`) and spawns an accept loop on the assigned tunnel port
-7. External request → Pingora `upstream_peer` resolves longest-prefix match → forwards to `127.0.0.1:<server_port>` → tunnel data channel → client `127.0.0.1:<client_port>` → container
+1. Server starts → port pool is **pre-bound** (every port in `port_pool` is `bind()`ed up front; startup fails fast if any is taken)
+2. Client connects → reports `ReportNodeStatus { hostname, os, arch, docker_version, port_range, cpu, mem, running_containers }` → upserted into SQLite (`client_nodes`)
+3. User loads an image via the panel — server records it (Git sources are shallow-cloned to verify a `Dockerfile` exists; the actual `docker build` runs on the client at deploy time)
+4. User creates a bridge and adds ports — for **each** port, the server immediately reserves one `pool_port` from the port pool and stores it in `bridge_ports.pool_port`. Deleting a port (or the whole bridge) releases the reservation back to the pool.
+5. User creates a connection (image + bridge + node). Server verifies the node is online, the bridge has pre-allocated pool ports, and no route paths conflict
+6. Server sends a single `ImageStart { image_tag, source, source_type, container_name, port_map, env }` over the control channel. The **client** decides what to do: if the image is already present locally it skips the pull/build; otherwise it `docker pull`s (Docker Hub source) or `git clone` + `docker build`s (Git source), then `docker run`s. On success the client replies with `ContainerStarted { ports }`.
+7. Server registers each `route` port in `RouteTable` (`/api` → `127.0.0.1:9001`) and spawns an accept loop on the pre-allocated pool port
+8. External request → Pingora `upstream_peer` resolves longest-prefix match → forwards to `127.0.0.1:<pool_port>` → tunnel data channel → client `127.0.0.1:<client_port>` → container
 
-When a node disconnects, the server marks its connections `pending`, releases the pool ports, removes the routes, and tears down the accept loops. When the node reconnects with the connection still configured, the auto-check loop redeploys it.
+`ImageStop` is the symmetric teardown — the server sends one command, the client `docker stop`s + `docker rm`s and replies with `ContainerStopped`.
+
+When a node disconnects the server marks its connections `pending`, removes the routes, and tears down the accept loops. The bridge's pool ports are **kept reserved** (they belong to the bridge config, not the deployment), so when the node reconnects the auto-check loop redeploys the same connection with the same ports. On the client side, containers and pulled images are kept for `image_cache_ttl_seconds` so a quick reconnect skips the pull/build entirely.
 
 On server restart, all nodes are marked offline; clients reconnect with backoff and re-register, and the auto-check loop redeploys ready connections.
 
@@ -294,8 +298,10 @@ kdct/
 
 - **TLS**: built-in via `rustls`. User-provided cert + key paths only — no ACME / Let's Encrypt automation. Toggle with the panel; restart `kdcts` to apply.
 - **HTTP ↔ HTTPS is exclusive**: the proxy binds either `http_port` or `https_port`, never both. There's no automatic HTTP→HTTPS redirect — front with Caddy/nginx if you want one.
-- **`/admin` is reserved on the public domain**: bridges cannot use a route path of `/admin` or anything under `/admin/`.
+- **`/admin` is reserved on the public domain**: bridges cannot use a route path of `/admin` or anything under `/admin/`. The bare `/` is fine — it's free for bridges.
+- **SPA fallback is scoped to `/admin`**: unmatched paths under `/admin/*` fall through to the panel's `index.html`; unmatched paths anywhere else return a normal 404 (so a misconfigured bridge route doesn't accidentally serve the panel HTML).
 - **Panel API binds to `127.0.0.1:<api_port>`**: also reachable via the proxy at `<domain>/admin/`. It has no built-in auth, so if you don't want anyone with the domain hitting it, front the proxy with basic auth or a VPN.
+- **Image cache on the client**: containers and pulled images are kept for `image_cache_ttl_seconds` (default 5 min) after a disconnect to make quick reconnects cheap. Tune it down for memory-constrained nodes.
 - **Per-client identity**: nodes are keyed by `auth_digest`, but `client_nodes.hostname` is also used as a registry key. Two clients sharing a hostname will currently collide.
 
 ---
