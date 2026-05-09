@@ -1,3 +1,4 @@
+mod acme;
 mod api;
 mod db;
 mod deploy;
@@ -87,25 +88,79 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     let db = Database::open(&db_path)?;
 
-    // Resolve TLS configuration: persisted toggle in DB + cert/key paths from
-    // config. TLS additionally requires a configured `domain` — without one,
-    // there's no name to bind a certificate to.
-    let tls_paths_ok = match (
-        server_config.tls_cert_path.as_deref(),
-        server_config.tls_key_path.as_deref(),
-    ) {
+    // ACME / Let's Encrypt auto-TLS. When enabled, replaces the manual
+    // tls_cert_path / tls_key_path with files we manage under a state dir.
+    let acme_cfg = server_config.acme.clone();
+    let acme_manager: Option<Arc<acme::AcmeManager>> = match (&domain, &acme_cfg) {
+        (Some(d), Some(cfg)) if cfg.enabled => match acme::AcmeManager::from_config(d, cfg) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                tracing::error!("ACME config rejected: {:#}", e);
+                None
+            }
+        },
+        (None, Some(cfg)) if cfg.enabled => {
+            tracing::error!(
+                "acme.enabled = true requires `domain` to be set in server.toml"
+            );
+            None
+        }
+        _ => None,
+    };
+
+    // If ACME is on, run the issuance/renewal flow before Pingora binds.
+    // After a successful flow, override the cert/key paths used by Pingora.
+    let (tls_cert_path_eff, tls_key_path_eff) = match &acme_manager {
+        Some(mgr) => {
+            if mgr.cert_needs_issue_or_renew() {
+                tracing::info!(
+                    "Obtaining TLS cert via ACME for {} (state dir: {})",
+                    mgr.domain,
+                    mgr.state_dir.display()
+                );
+                if let Err(e) = mgr.obtain_or_renew(http_port).await {
+                    tracing::error!("ACME initial issuance failed: {:#}", e);
+                }
+            } else if let Some(days) = mgr.cert_days_remaining() {
+                tracing::info!(
+                    "Reusing on-disk ACME cert for {} ({} days remaining)",
+                    mgr.domain,
+                    days
+                );
+            }
+            let cert = mgr.cert_path().to_string_lossy().to_string();
+            let key = mgr.key_path().to_string_lossy().to_string();
+            (Some(cert), Some(key))
+        }
+        None => (
+            server_config.tls_cert_path.clone(),
+            server_config.tls_key_path.clone(),
+        ),
+    };
+
+    // Resolve TLS configuration: persisted toggle in DB + cert/key paths
+    // (either from acme manager or from config). TLS additionally requires
+    // a configured `domain`.
+    let tls_paths_ok = match (tls_cert_path_eff.as_deref(), tls_key_path_eff.as_deref()) {
         (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => {
             std::path::Path::new(c).is_file() && std::path::Path::new(k).is_file()
         }
         _ => false,
     };
     let tls_configurable = domain.is_some() && tls_paths_ok;
-    let tls_persisted = db
+    // ACME implies the user wants TLS. If ACME is enabled and our paths are
+    // good, force the toggle on so the user doesn't need to flip it manually.
+    let mut tls_persisted = db
         .get_setting("tls_enabled")
         .ok()
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
+    if acme_manager.is_some() && tls_paths_ok && !tls_persisted {
+        tls_persisted = true;
+        let _ = db.set_setting("tls_enabled", "true");
+        tracing::info!("ACME enabled — turning on persisted TLS toggle");
+    }
     let tls_live = tls_persisted && tls_configurable;
     if tls_persisted && !tls_configurable {
         tracing::warn!(
@@ -115,12 +170,20 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     }
     let tls_for_proxy = if tls_live {
         Some(crate::proxy::TlsConfig {
-            cert_path: server_config.tls_cert_path.clone().unwrap_or_default(),
-            key_path: server_config.tls_key_path.clone().unwrap_or_default(),
+            cert_path: tls_cert_path_eff.clone().unwrap_or_default(),
+            key_path: tls_key_path_eff.clone().unwrap_or_default(),
         })
     } else {
         None
     };
+
+    // Spawn renewal task once TLS is up. Runs once a day; only acts when
+    // <30 days remain on the on-disk cert.
+    if tls_live {
+        if let Some(mgr) = acme_manager.clone() {
+            acme::spawn_renewal_task(mgr, http_port);
+        }
+    }
 
     let route_table = Arc::new(RwLock::new(RouteTable::new()));
 
