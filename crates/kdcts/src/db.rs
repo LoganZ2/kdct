@@ -42,7 +42,9 @@ pub struct ClientNode {
     pub cpu_cores: i64,
     pub memory_mb: i64,
     pub status: String,
-    pub auth_digest: Option<String>,
+    /// Stable per-machine identifier assigned by the server on the client's
+    /// first connect and persisted client-side.
+    pub node_uuid: String,
     pub last_seen: i64,
 }
 
@@ -131,12 +133,35 @@ impl Database {
                 cpu_cores INTEGER NOT NULL DEFAULT 0,
                 memory_mb INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'offline',
-                auth_digest TEXT UNIQUE,
+                node_uuid TEXT UNIQUE,
                 last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             ",
         )
         .context("Failed to run migrations")?;
+
+        // Add node_uuid column to pre-existing databases that still have the
+        // old auth_digest column. The two columns coexist briefly during the
+        // upgrade — auth_digest is unused after migration. We don't drop it
+        // here so existing rows aren't lost; SQLite makes column drops awkward
+        // and the dead column is harmless.
+        let column_exists = |name: &str| -> bool {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = match conn.prepare("PRAGMA table_info(client_nodes)") {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1));
+            match rows {
+                Ok(rs) => rs.filter_map(|r| r.ok()).any(|n| n == name),
+                Err(_) => false,
+            }
+        };
+        if !column_exists("node_uuid") {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("ALTER TABLE client_nodes ADD COLUMN node_uuid TEXT UNIQUE", [])
+                .context("Failed to add node_uuid column")?;
+        }
         Ok(())
     }
 
@@ -507,7 +532,7 @@ impl Database {
 
     pub fn upsert_node(
         &self,
-        auth_digest: &str,
+        node_uuid: &str,
         hostname: &str,
         os: &str,
         arch: &str,
@@ -519,15 +544,15 @@ impl Database {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO client_nodes (hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, status, auth_digest, last_seen) \
+            "INSERT INTO client_nodes (hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, status, node_uuid, last_seen) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'online', ?9, strftime('%s','now')) \
-             ON CONFLICT(auth_digest) DO UPDATE SET \
+             ON CONFLICT(node_uuid) DO UPDATE SET \
              hostname=excluded.hostname, os=excluded.os, arch=excluded.arch, \
              docker_version=excluded.docker_version, \
              port_range_start=excluded.port_range_start, port_range_end=excluded.port_range_end, \
              cpu_cores=excluded.cpu_cores, memory_mb=excluded.memory_mb, \
              status='online', last_seen=strftime('%s','now')",
-            params![hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, auth_digest],
+            params![hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, node_uuid],
         )?;
         Ok(())
     }
@@ -536,7 +561,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, hostname, os, arch, docker_version, port_range_start, port_range_end, \
-             cpu_cores, memory_mb, status, auth_digest, last_seen FROM client_nodes ORDER BY last_seen DESC",
+             cpu_cores, memory_mb, status, COALESCE(node_uuid, ''), last_seen \
+             FROM client_nodes WHERE node_uuid IS NOT NULL ORDER BY last_seen DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ClientNode {
@@ -550,18 +576,18 @@ impl Database {
                 cpu_cores: row.get(7)?,
                 memory_mb: row.get(8)?,
                 status: row.get(9)?,
-                auth_digest: row.get(10)?,
+                node_uuid: row.get(10)?,
                 last_seen: row.get(11)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn set_node_offline(&self, auth_digest: &str) -> Result<()> {
+    pub fn set_node_offline(&self, node_uuid: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE client_nodes SET status='offline' WHERE auth_digest=?1",
-            params![auth_digest],
+            "UPDATE client_nodes SET status='offline' WHERE node_uuid=?1",
+            params![node_uuid],
         )?;
         Ok(())
     }
@@ -576,7 +602,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, hostname, os, arch, docker_version, port_range_start, port_range_end, \
-             cpu_cores, memory_mb, status, auth_digest, last_seen FROM client_nodes WHERE id=?1",
+             cpu_cores, memory_mb, status, COALESCE(node_uuid, ''), last_seen \
+             FROM client_nodes WHERE id=?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(ClientNode {
@@ -590,7 +617,33 @@ impl Database {
                 cpu_cores: row.get(7)?,
                 memory_mb: row.get(8)?,
                 status: row.get(9)?,
-                auth_digest: row.get(10)?,
+                node_uuid: row.get(10)?,
+                last_seen: row.get(11)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn get_node_by_uuid(&self, node_uuid: &str) -> Result<Option<ClientNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, hostname, os, arch, docker_version, port_range_start, port_range_end, \
+             cpu_cores, memory_mb, status, COALESCE(node_uuid, ''), last_seen \
+             FROM client_nodes WHERE node_uuid=?1",
+        )?;
+        let mut rows = stmt.query_map(params![node_uuid], |row| {
+            Ok(ClientNode {
+                id: row.get(0)?,
+                hostname: row.get(1)?,
+                os: row.get(2)?,
+                arch: row.get(3)?,
+                docker_version: row.get(4)?,
+                port_range_start: row.get(5)?,
+                port_range_end: row.get(6)?,
+                cpu_cores: row.get(7)?,
+                memory_mb: row.get(8)?,
+                status: row.get(9)?,
+                node_uuid: row.get(10)?,
                 last_seen: row.get(11)?,
             })
         })?;

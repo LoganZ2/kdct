@@ -423,6 +423,12 @@ where
         let port_data_pending = Arc::new(RwLock::new(VecDeque::new()));
         let port_data_callbacks = Arc::new(RwLock::new(VecDeque::new()));
 
+        // Shared with the run loop: filled in once the client reports its
+        // node_uuid. Used by the cleanup task to remove the registry entry on
+        // disconnect.
+        let node_uuid_slot: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
         let service_name = service.name.clone();
         let ch = ControlChannel::<T> {
             conn,
@@ -441,16 +447,22 @@ where
             shutdown_tx: shutdown_tx.clone(),
             node_update_tx: node_update_tx.clone(),
             hostname: None,
+            node_uuid: None,
+            node_uuid_slot: node_uuid_slot.clone(),
             pending_docker: pending_docker.clone(),
         };
 
+        let _ = digest_for_drop;
         tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
                 }
                 let _ = shutdown_tx_clone.send(true);
-                registry::remove(&clients_for_drop, &digest_for_drop).await;
+                let uuid = node_uuid_slot.lock().await.clone();
+                if let Some(uuid) = uuid {
+                    registry::remove(&clients_for_drop, &uuid).await;
+                }
             }
             .instrument(Span::current()),
         );
@@ -474,6 +486,7 @@ struct ControlChannel<T: Transport> {
     heartbeat_interval: u64,
     cmd_rx: mpsc::Receiver<ControlChannelCmd>,
     cmd_tx: mpsc::Sender<ControlChannelCmd>,
+    #[allow(dead_code)]
     service_digest: ServiceDigest,
     service_name: String,
     clients: ClientRegistry,
@@ -484,6 +497,12 @@ struct ControlChannel<T: Transport> {
     shutdown_tx: broadcast::Sender<bool>,
     node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
     hostname: Option<String>,
+    /// Stable per-machine UUID once known (received in ReportNodeStatus, or
+    /// generated server-side and sent back via AssignNodeUuid).
+    node_uuid: Option<String>,
+    /// Mirror of `node_uuid` shared with the cleanup task so it can find the
+    /// registry entry to remove when the channel exits.
+    node_uuid_slot: Arc<tokio::sync::Mutex<Option<String>>>,
     pending_docker: Arc<RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Result<Vec<u16>, String>>>>>,
 }
 
@@ -502,18 +521,41 @@ impl<T: Transport> ControlChannel<T> {
             tokio::select! {
                 val = read_control_cmd(&mut rd) => {
                     match val {
-                        Ok(ControlChannelCmd::ReportNodeStatus { hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers }) => {
+                        Ok(ControlChannelCmd::ReportNodeStatus { node_uuid, hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers }) => {
+                            // Assign a UUID if the client doesn't have one yet. We accept any
+                            // syntactically valid UUID the client sends; otherwise issue a fresh one.
+                            let uuid = match node_uuid.as_deref().and_then(|s| {
+                                let trimmed = s.trim();
+                                if trimmed.is_empty() { None } else { uuid::Uuid::parse_str(trimmed).ok().map(|_| trimmed.to_string()) }
+                            }) {
+                                Some(u) => u,
+                                None => {
+                                    let new_uuid = uuid::Uuid::new_v4().to_string();
+                                    info!("Assigning node_uuid={} to {} ({})", new_uuid, self.service_name, hostname);
+                                    let _ = self.cmd_tx.send(ControlChannelCmd::AssignNodeUuid { uuid: new_uuid.clone() }).await;
+                                    new_uuid
+                                }
+                            };
+
+                            // If this connection now owns a different UUID than a previous
+                            // ReportNodeStatus on the same channel (shouldn't happen in normal use),
+                            // drop the old registry entry.
+                            if let Some(prev) = self.node_uuid.as_ref() {
+                                if prev != &uuid {
+                                    crate::registry::remove(&self.clients, prev).await;
+                                }
+                            }
+
                             info!(
-                                "Client status: {} {} {} docker={} ports={}-{} cpu={} mem={}MB containers={}",
-                                hostname, os, arch, docker_version,
+                                "Client status: uuid={} {} {} {} docker={} ports={}-{} cpu={} mem={}MB containers={}",
+                                uuid, hostname, os, arch, docker_version,
                                 port_range_start, port_range_end,
                                 cpu_cores, memory_mb,
                                 running_containers.len()
                             );
                             registry::upsert(
                                 &self.clients,
-                                self.service_digest,
-                                self.service_name.clone(),
+                                uuid.clone(),
                                 hostname.clone(),
                                 os.clone(),
                                 arch.clone(),
@@ -529,8 +571,11 @@ impl<T: Transport> ControlChannel<T> {
                                 self.port_data_callbacks.clone(),
                             ).await;
 
+                            self.node_uuid = Some(uuid.clone());
+                            *self.node_uuid_slot.lock().await = Some(uuid.clone());
+
                             let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
-                                digest: hex::encode(self.service_digest),
+                                uuid: uuid.clone(),
                                 event: crate::node_update::NodeEvent::Connected {
                                     hostname: hostname.clone(),
                                     os,
@@ -559,13 +604,15 @@ impl<T: Transport> ControlChannel<T> {
                             if let Some(tx) = pending.remove(&container_name) {
                                 let _ = tx.send(Ok(ports.clone()));
                             }
-                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
-                                digest: hex::encode(self.service_digest),
-                                event: crate::node_update::NodeEvent::ContainerStarted {
-                                    container_name: container_name.clone(),
-                                    ports,
-                                },
-                            }).await;
+                            if let Some(uuid) = self.node_uuid.clone() {
+                                let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                    uuid,
+                                    event: crate::node_update::NodeEvent::ContainerStarted {
+                                        container_name: container_name.clone(),
+                                        ports,
+                                    },
+                                }).await;
+                            }
                         }
                         Ok(ControlChannelCmd::ContainerStopped { container_name }) => {
                             info!("Container stopped: {}", container_name);
@@ -573,12 +620,14 @@ impl<T: Transport> ControlChannel<T> {
                             if let Some(tx) = pending.remove(&container_name) {
                                 let _ = tx.send(Ok(vec![]));
                             }
-                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
-                                digest: hex::encode(self.service_digest),
-                                event: crate::node_update::NodeEvent::ContainerStopped {
-                                    container_name: container_name.clone(),
-                                },
-                            }).await;
+                            if let Some(uuid) = self.node_uuid.clone() {
+                                let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                    uuid,
+                                    event: crate::node_update::NodeEvent::ContainerStopped {
+                                        container_name: container_name.clone(),
+                                    },
+                                }).await;
+                            }
                         }
                         Ok(ControlChannelCmd::ContainerError { container_name, error }) => {
                             error!("Container error: {} — {}", container_name, error);
@@ -586,13 +635,15 @@ impl<T: Transport> ControlChannel<T> {
                             if let Some(tx) = pending.remove(&container_name) {
                                 let _ = tx.send(Err(error.clone()));
                             }
-                            let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
-                                digest: hex::encode(self.service_digest),
-                                event: crate::node_update::NodeEvent::ContainerError {
-                                    container_name: container_name.clone(),
-                                    error: error.clone(),
-                                },
-                            });
+                            if let Some(uuid) = self.node_uuid.clone() {
+                                let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
+                                    uuid,
+                                    event: crate::node_update::NodeEvent::ContainerError {
+                                        container_name: container_name.clone(),
+                                        error: error.clone(),
+                                    },
+                                });
+                            }
                         }
                         Ok(_) => {
                             debug!("Unexpected control cmd from client");
@@ -648,9 +699,9 @@ impl<T: Transport> ControlChannel<T> {
 
         info!("Control channel shutdown");
 
-        if let Some(hostname) = self.hostname.take() {
+        if let (Some(hostname), Some(uuid)) = (self.hostname.take(), self.node_uuid.clone()) {
             let _ = self.node_update_tx.send(crate::node_update::NodeUpdate {
-                digest: hex::encode(self.service_digest),
+                uuid,
                 event: crate::node_update::NodeEvent::Disconnected { hostname },
             }).await;
         }

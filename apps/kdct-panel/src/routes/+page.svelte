@@ -220,17 +220,19 @@
   <div class="section">
     <div class="section-head"><h2>Nodes</h2><span class="dim">{online.length} online</span></div>
     <table>
-      <thead><tr><th>Hostname</th><th>OS</th><th>Docker</th><th>CPU</th><th>Memory</th><th>Port Range</th><th>Status</th><th>Last Seen</th></tr></thead>
+      <thead><tr><th>Hostname</th><th>UUID</th><th>OS</th><th>Docker</th><th>CPU</th><th>Memory</th><th>Port Range</th><th>Status</th><th>Last Seen</th></tr></thead>
       <tbody>
         {#each nodes as n}
           <tr>
-            <td class="hi">{n.hostname}</td><td class="dim">{n.os} {n.arch}</td><td class="dim">{dk(n.docker_version)}</td>
+            <td class="hi">{n.hostname}</td>
+            <td class="dim mono" title={n.node_uuid ?? ''} style="font-size:10px">{n.node_uuid ? n.node_uuid.slice(0, 8) : '—'}</td>
+            <td class="dim">{n.os} {n.arch}</td><td class="dim">{dk(n.docker_version)}</td>
             <td class="dim">{n.cpu_cores} cores</td><td class="dim">{mem(n.memory_mb)}</td>
             <td class="dim">{n.port_range_start}–{n.port_range_end}</td>
             <td><span class="badge {n.status}">{n.status}</span></td><td class="dim">{ago(n.last_seen)}</td>
           </tr>
         {:else}
-          <tr><td colspan="8" class="dim" style="text-align:center;padding:20px">No nodes connected.</td></tr>
+          <tr><td colspan="9" class="dim" style="text-align:center;padding:20px">No nodes connected.</td></tr>
         {/each}
       </tbody>
     </table>

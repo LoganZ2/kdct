@@ -29,6 +29,37 @@ struct TrackedContainer {
     image_tag: String,
 }
 
+/// Persisted per-machine identity. Lives at `~/.kdct/node_id` (one UUID per
+/// line) and is loaded/saved by the client. The first time a new install
+/// connects, the file is missing and the server assigns a UUID via
+/// `AssignNodeUuid`, which the client then writes here.
+struct NodeIdentity;
+
+impl NodeIdentity {
+    fn path() -> PathBuf {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".kdct").join("node_id")
+    }
+
+    fn load() -> Option<String> {
+        let raw = std::fs::read_to_string(Self::path()).ok()?;
+        let s = raw.trim();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    }
+
+    fn save(uuid: &str) {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, uuid) {
+            warn!("Failed to persist node_id at {}: {:#}", path.display(), e);
+        }
+    }
+}
+
 struct ImageCache {
     entries: HashMap<String, i64>,
 }
@@ -364,6 +395,9 @@ struct ControlChannel<T: Transport> {
     containers: Arc<Mutex<Vec<TrackedContainer>>>,
     /// Image pull cache
     image_cache: Arc<Mutex<ImageCache>>,
+    /// Persisted node identity. Shared across reconnections; updated when the
+    /// server assigns a UUID via AssignNodeUuid.
+    node_uuid: Arc<Mutex<Option<String>>>,
 }
 
 pub struct ControlChannelHandle {
@@ -418,10 +452,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
         let (mut rd, wr) = io::split(conn);
         let wr = Arc::new(tokio::sync::Mutex::new(wr));
 
-        // Send ReportNodeStatus to register with the server
+        // Send ReportNodeStatus to register with the server. Carries our
+        // persisted node UUID (or None on first ever connect, in which case the
+        // server will reply with AssignNodeUuid).
         {
             let mut guard = wr.lock().await;
-            let cmd = gather_node_status(&self.service).await;
+            let uuid = self.node_uuid.lock().unwrap().clone();
+            let cmd = gather_node_status(&self.service, uuid).await;
             if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
                 warn!("Failed to send ReportNodeStatus: {:#}", e);
             }
@@ -454,13 +491,19 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         },
                         ControlChannelCmd::HeartBeat => {
                             let mut guard = wr.lock().await;
-                            let cmd = gather_node_status(&self.service).await;
+                            let uuid = self.node_uuid.lock().unwrap().clone();
+                            let cmd = gather_node_status(&self.service, uuid).await;
                             if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
                                 warn!("Failed to send heartbeat status: {:#}", e);
                             }
                         }
                         ControlChannelCmd::PortsAssigned { mappings } => {
                             info!("Server assigned ports: {:?}", mappings);
+                        }
+                        ControlChannelCmd::AssignNodeUuid { uuid } => {
+                            info!("Server assigned node_uuid={}", uuid);
+                            *self.node_uuid.lock().unwrap() = Some(uuid.clone());
+                            NodeIdentity::save(&uuid);
                         }
                         ControlChannelCmd::ImageStart { image_tag, source, source_type, container_name, port_map, env } => {
                             let wr = wr.clone();
@@ -517,7 +560,8 @@ impl<T: 'static + Transport> ControlChannel<T> {
                 },
                 _ = status_interval.tick() => {
                     let mut guard = wr.lock().await;
-                    let cmd = gather_node_status(&self.service).await;
+                    let uuid = self.node_uuid.lock().unwrap().clone();
+                    let cmd = gather_node_status(&self.service, uuid).await;
                     if let Err(e) = protocol::write_control_cmd(&mut *guard, &cmd).await {
                         warn!("Failed to send periodic status: {:#}", e);
                     }
@@ -553,6 +597,14 @@ impl ControlChannelHandle {
             Arc::new(Mutex::new(Vec::new()));
         let image_cache: Arc<Mutex<ImageCache>> =
             Arc::new(Mutex::new(ImageCache::load()));
+        let node_uuid: Arc<Mutex<Option<String>>> =
+            Arc::new(Mutex::new(NodeIdentity::load()));
+
+        if let Some(u) = node_uuid.lock().unwrap().as_ref() {
+            info!("Loaded node_uuid={}", u);
+        } else {
+            info!("No persisted node_uuid; will request one from the server on first connect");
+        }
 
         let retry_interval = service.retry_interval;
         let cache_ttl = service.image_cache_ttl_seconds;
@@ -568,6 +620,7 @@ impl ControlChannelHandle {
             heartbeat_timeout,
             containers: containers.clone(),
             image_cache: image_cache.clone(),
+            node_uuid: node_uuid.clone(),
         };
 
         tokio::spawn(
@@ -722,7 +775,7 @@ async fn get_running_containers() -> Vec<crate::protocol::ContainerInfo> {
         _ => Vec::new(),
     }
 }
-async fn gather_node_status(service: &ClientServiceConfig) -> ControlChannelCmd {
+async fn gather_node_status(service: &ClientServiceConfig, node_uuid: Option<String>) -> ControlChannelCmd {
     let hostname = get_hostname();
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
@@ -733,6 +786,7 @@ async fn gather_node_status(service: &ClientServiceConfig) -> ControlChannelCmd 
     let running_containers = get_running_containers().await;
 
     ControlChannelCmd::ReportNodeStatus {
+        node_uuid,
         hostname,
         os,
         arch,

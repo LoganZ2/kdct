@@ -31,8 +31,11 @@ pub enum NodeEvent {
 
 /// Sent from server control channel when a client reports status or disconnects.
 /// The kdcts binary picks this up and writes to SQLite.
+///
+/// `uuid` is the stable per-machine identifier (persisted by the client and
+/// assigned by the server on first connect).
 #[derive(Debug, Clone)]
 pub struct NodeUpdate {
-    pub digest: String,
+    pub uuid: String,
     pub event: NodeEvent,
 }

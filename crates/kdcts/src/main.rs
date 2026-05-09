@@ -164,7 +164,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                         NodeEvent::Connected { hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers: _ } => {
                             if let Ok(d) = Database::open(&sync_db_path) {
                                 let _ = d.upsert_node(
-                                    &update.digest,
+                                    &update.uuid,
                                     &hostname, &os, &arch,
                                     &docker_version,
                                     port_range_start as i64,
@@ -178,14 +178,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                         NodeEvent::Disconnected { hostname: _ } => {
                             if let Ok(d) = Database::open(&sync_db_path) {
                                 // Mark connections as pending for this node
-                                d.set_node_offline(&update.digest);
-                                // Find node_id from digest
-                                if let Ok(nodes) = d.list_nodes() {
-                                    if let Some(node) = nodes.iter().find(|n| n.auth_digest.as_deref() == Some(&update.digest)) {
-                                        if let Ok(conn_ids) = d.get_connection_ids_for_node(node.id) {
-                                            for cid in conn_ids {
-                                                let _ = d.update_connection_node(cid, Some(node.id), "pending", None);
-                                            }
+                                let _ = d.set_node_offline(&update.uuid);
+                                if let Ok(Some(node)) = d.get_node_by_uuid(&update.uuid) {
+                                    if let Ok(conn_ids) = d.get_connection_ids_for_node(node.id) {
+                                        for cid in conn_ids {
+                                            let _ = d.update_connection_node(cid, Some(node.id), "pending", None);
                                         }
                                     }
                                 }
@@ -194,7 +191,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                                 &sync_tracker,
                                 &sync_rt,
                                 &sync_pool,
-                                &update.digest,
+                                &update.uuid,
                             ).await;
                         }
                         NodeEvent::ContainerStarted { container_name, ports } => {
