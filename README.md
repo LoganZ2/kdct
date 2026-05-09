@@ -118,7 +118,9 @@ KDCT splits a deployment into three reusable pieces, joined by a connection:
 
 ## TLS
 
-Requires `domain` plus `tls_cert_path` and `tls_key_path` pointing at a real cert and key. When all three are present, the **TLS toggle** in the panel's settings becomes available. Flip it on, restart `kdcts`, done. Pingora binds either `http_port` or `https_port`, never both — there's no mixed-mode and no auto-redirect. Front with Caddy/nginx if you need one.
+Requires `domain` plus `tls_cert_path` and `tls_key_path` pointing at a real cert and key. When all three are present, the **TLS toggle** in the panel's settings becomes available. Flip it on, restart `kdcts`, done.
+
+When TLS is on, `kdcts` serves HTTPS on `https_port` and a 301 redirector on `http_port` — `http://your.domain/x` becomes `https://your.domain/x`. The redirect is unconditional; there's no mixed-mode HTTP+HTTPS.
 
 No ACME / Let's Encrypt automation; bring your own cert.
 
@@ -175,7 +177,6 @@ kdct/
 
 - **Panel has optional basic auth.** Set `admin_user` and `admin_password` in `server.toml` to protect `/admin/` with HTTP Basic Authentication. Not required, but recommended for production.
 - **Hostname collision.** Nodes are keyed by SHA-256 auth digest, but the registry also indexes by hostname. Two clients sharing a hostname currently collide.
-- **No HTTP→HTTPS redirect.** TLS-on means HTTP is gone; if you want both, terminate elsewhere.
 
 ## License
 
