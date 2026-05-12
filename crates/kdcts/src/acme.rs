@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use tunnel::config::AcmeConfig;
@@ -53,11 +54,20 @@ impl AcmeManager {
         let directory_url = cfg.directory_url.clone().unwrap_or_else(|| {
             if cfg.staging { LE_DIRECTORY_STAGING.into() } else { LE_DIRECTORY_PROD.into() }
         });
-        let state_dir = cfg
+        let state_dir_raw = cfg
             .state_dir
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("kdct-state").join("acme").join(domain));
+        // Resolve to absolute so logs and renewal don't depend on CWD —
+        // under systemd CWD is `/` and a relative path would surprise.
+        let state_dir = if state_dir_raw.is_absolute() {
+            state_dir_raw
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(&state_dir_raw))
+                .unwrap_or(state_dir_raw)
+        };
         Ok(Self { domain: domain.to_string(), email, directory_url, state_dir })
     }
 
@@ -70,7 +80,7 @@ impl AcmeManager {
     pub fn cert_days_remaining(&self) -> Option<i64> {
         let pem = std::fs::read(self.cert_path()).ok()?;
         let pem_str = std::str::from_utf8(&pem).ok()?;
-        let der = pem_to_der(pem_str)?;
+        let der = first_cert_pem_to_der(pem_str)?;
         let (_, parsed) = x509_parser::parse_x509_certificate(&der).ok()?;
         let not_after = parsed.validity().not_after.timestamp();
         let now = std::time::SystemTime::now()
@@ -91,8 +101,20 @@ impl AcmeManager {
     /// for the duration of the flow to serve HTTP-01 challenges, then drops
     /// the listener.
     pub async fn obtain_or_renew(&self, http_port: u16) -> Result<()> {
-        std::fs::create_dir_all(&self.state_dir)
+        tokio::fs::create_dir_all(&self.state_dir)
+            .await
             .with_context(|| format!("Failed to create ACME state dir {}", self.state_dir.display()))?;
+        // The state dir holds the ACME account key and the cert private
+        // key — neither should be world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(
+                &self.state_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .await;
+        }
 
         let challenges: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
@@ -101,6 +123,8 @@ impl AcmeManager {
             .await
             .with_context(|| format!("Failed to bind ACME challenge listener on {}", listen_addr))?;
         info!("ACME challenge listener on {}", listen_addr);
+
+        let conn_semaphore: Arc<Semaphore> = Arc::new(Semaphore::new(64));
 
         let challenges_for_task = challenges.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -111,7 +135,9 @@ impl AcmeManager {
                         match accept {
                             Ok((sock, _)) => {
                                 let challenges = challenges_for_task.clone();
+                                let sem = conn_semaphore.clone();
                                 tokio::spawn(async move {
+                                    let _permit = sem.acquire().await;
                                     if let Err(e) = serve_challenge(sock, challenges).await {
                                         warn!("ACME challenge serve error: {:#}", e);
                                     }
@@ -127,7 +153,10 @@ impl AcmeManager {
             }
         });
 
-        let result = self.run_acme_flow(challenges).await;
+        let result = match timeout(Duration::from_secs(120), self.run_acme_flow(challenges)).await {
+            Ok(inner) => inner,
+            Err(_) => Err(anyhow!("ACME flow timed out after 2 minutes")),
+        };
         let _ = stop_tx.send(());
         let _ = listener_handle.await;
         result
@@ -140,7 +169,7 @@ impl AcmeManager {
         };
 
         // Load or create account credentials.
-        let account = match std::fs::read(self.account_path()) {
+        let account = match tokio::fs::read(self.account_path()).await {
             Ok(bytes) => {
                 let creds: AccountCredentials = serde_json::from_slice(&bytes)
                     .context("Failed to parse stored ACME account credentials")?;
@@ -168,8 +197,11 @@ impl AcmeManager {
                     .context("Failed to create ACME account")?;
                 let json = serde_json::to_vec_pretty(&creds)
                     .context("Failed to serialize ACME credentials")?;
-                std::fs::write(self.account_path(), json)
+                let acct_path = self.account_path();
+                tokio::fs::write(&acct_path, json)
+                    .await
                     .context("Failed to persist ACME account credentials")?;
+                restrict_perms(&acct_path).await;
                 account
             }
         };
@@ -252,9 +284,12 @@ impl AcmeManager {
         };
 
         write_atomic(&self.cert_path(), cert_chain_pem.as_bytes())
+            .await
             .with_context(|| format!("Failed to write {}", self.cert_path().display()))?;
         write_atomic(&self.key_path(), key_pem.as_bytes())
+            .await
             .with_context(|| format!("Failed to write {}", self.key_path().display()))?;
+        restrict_perms(&self.key_path()).await;
 
         info!(
             "ACME cert written to {} (key: {})",
@@ -290,7 +325,11 @@ pub fn spawn_renewal_task(manager: Arc<AcmeManager>, http_port: u16) {
                 warn!("ACME cert is unreadable on disk — attempting fresh issuance");
             }
             match manager.obtain_or_renew(http_port).await {
-                Ok(()) => info!("ACME cert renewed successfully (restart kdcts to use it)"),
+                Ok(()) => {
+                    info!("ACME cert renewed successfully — restarting to apply");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    crate::self_restart();
+                }
                 Err(e) => error!("ACME renewal failed: {:#}", e),
             }
         }
@@ -301,8 +340,6 @@ async fn serve_challenge(
     mut sock: tokio::net::TcpStream,
     challenges: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<()> {
-    use tokio::time::timeout;
-
     let mut buf = [0u8; 4096];
     let mut filled = 0usize;
     loop {
@@ -346,16 +383,28 @@ async fn serve_challenge(
     Ok(())
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    tokio::fs::write(&tmp, data).await?;
+    tokio::fs::rename(&tmp, path).await?;
     Ok(())
+}
+
+/// Restrict a file to 0o600 on Unix. Used for the private key and the
+/// ACME account credentials. Best-effort: ignored on non-Unix.
+async fn restrict_perms(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Extract the first PEM block's DER bytes from a string. Used for the
 /// leaf cert when computing remaining validity.
-fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
+fn first_cert_pem_to_der(pem: &str) -> Option<Vec<u8>> {
     let begin = pem.find("-----BEGIN CERTIFICATE-----")?;
     let after_begin = &pem[begin..];
     let end_marker = "-----END CERTIFICATE-----";

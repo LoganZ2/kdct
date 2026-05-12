@@ -18,6 +18,30 @@ use std::collections::HashMap;
 use tokio::sync::{broadcast, RwLock};
 use tracing_subscriber::EnvFilter;
 
+/// Replace the current process image with a fresh copy of ourselves
+/// (same exe, same argv). Uses Unix `execv` so the PID is preserved —
+/// systemd / openrc / runit / nohup all keep their supervisor handle.
+/// A plain `spawn` + `exit` would orphan the new process and break
+/// `Type=simple` units that expect the tracked PID to stay alive.
+pub(crate) fn self_restart() -> ! {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().expect("current_exe");
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let err = std::process::Command::new(&exe).args(&args).exec();
+    // `exec` only returns on failure.
+    tracing::error!("Failed to exec kdcts: {}", err);
+    std::process::exit(1);
+}
+
+/// Spawn a background thread that waits 500ms (so the HTTP response has
+/// time to flush) and then `exec`s a fresh copy of ourselves in place.
+pub(crate) fn delayed_restart() {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        self_restart();
+    });
+}
+
 use crate::db::Database;
 use crate::proxy::RouteTable;
 use tunnel::node_update::NodeEvent;
@@ -90,7 +114,51 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     // ACME / Let's Encrypt auto-TLS. When enabled, replaces the manual
     // tls_cert_path / tls_key_path with files we manage under a state dir.
-    let acme_cfg = server_config.acme.clone();
+    //
+    // Precedence: if the panel has ever written ACME settings to the DB
+    // (key `acme_enabled` present, regardless of value), the DB owns the
+    // config — that way disabling via the panel actually disables ACME
+    // even if server.toml still has `[server.acme] enabled = true`. If
+    // the panel has never touched these settings, server.toml wins.
+    // `directory_url` is only configurable from server.toml since the
+    // panel doesn't expose it; we carry it forward in DB-mode.
+    let db_acme_present = matches!(db.get_setting("acme_enabled"), Ok(Some(_)));
+    let acme_cfg = if db_acme_present {
+        let toml_base = server_config.acme.clone().unwrap_or_default();
+        let enabled = db
+            .get_setting("acme_enabled")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let email = db
+            .get_setting("acme_email")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .or(toml_base.email);
+        let staging = db
+            .get_setting("acme_staging")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(toml_base.staging);
+        let state_dir = db
+            .get_setting("acme_state_dir")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .or(toml_base.state_dir);
+        Some(tunnel::config::AcmeConfig {
+            enabled,
+            email,
+            staging,
+            directory_url: toml_base.directory_url,
+            state_dir,
+        })
+    } else {
+        server_config.acme.clone()
+    };
     let acme_manager: Option<Arc<acme::AcmeManager>> = match (&domain, &acme_cfg) {
         (Some(d), Some(cfg)) if cfg.enabled => match acme::AcmeManager::from_config(d, cfg) {
             Ok(m) => Some(Arc::new(m)),
