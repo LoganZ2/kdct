@@ -1346,6 +1346,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnel",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

@@ -13,6 +13,21 @@ pub type SyncedCallback = Mutex<Option<ForwardCallback>>;
 /// share a hostname (or a service name in client.toml) no longer collide.
 pub type NodeUuid = String;
 
+/// `service_digest` (hex) → `node_uuid`. The server uses this to verify uuid
+/// claims: once a digest is bound to a uuid, only that uuid is accepted from
+/// clients authenticating with the same digest. This prevents same-token
+/// clients from spoofing each other's identity by editing `~/.kdct/node_id`.
+///
+/// The map is loaded from SQLite at kdcts startup and updated in-memory when
+/// a new binding is created; the persisted row is written via the existing
+/// `NodeEvent::Connected` → `upsert_node` path (which now carries the
+/// `service_digest` alongside the uuid).
+pub type NodeBindings = Arc<RwLock<HashMap<String, NodeUuid>>>;
+
+pub fn new_bindings() -> NodeBindings {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 pub struct ClientEntry {
     pub node_uuid: NodeUuid,
     pub hostname: String,

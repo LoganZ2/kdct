@@ -142,9 +142,24 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let (node_update_tx, mut node_update_rx) =
                 tokio::sync::mpsc::channel::<tunnel::node_update::NodeUpdate>(1024);
 
-            let mut server =
-                Server::<TcpTransport>::from(server_config.clone(), Some(pool.clone()), node_update_tx)
-                    .await?;
+            // Seed the tunnel server's binding map (service_digest → node_uuid)
+            // from SQLite so the spoof-prevention check survives restarts.
+            let bindings = tunnel::registry::new_bindings();
+            {
+                let mut guard = bindings.write().await;
+                for (digest, uuid) in db.load_bindings().unwrap_or_default() {
+                    guard.insert(digest, uuid);
+                }
+                tracing::info!("Loaded {} node binding(s) from DB", guard.len());
+            }
+
+            let mut server = Server::<TcpTransport>::from(
+                server_config.clone(),
+                Some(pool.clone()),
+                node_update_tx,
+                bindings,
+            )
+            .await?;
             let clients = server.clients.clone();
             let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -161,10 +176,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             tokio::spawn(async move {
                 while let Some(update) = node_update_rx.recv().await {
                     match update.event {
-                        NodeEvent::Connected { hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers: _ } => {
+                        NodeEvent::Connected { service_digest, hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers: _ } => {
                             if let Ok(d) = Database::open(&sync_db_path) {
                                 let _ = d.upsert_node(
                                     &update.uuid,
+                                    &service_digest,
                                     &hostname, &os, &arch,
                                     &docker_version,
                                     port_range_start as i64,

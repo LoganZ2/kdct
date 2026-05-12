@@ -3,6 +3,10 @@ use crate::protocol::ContainerInfo;
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
     Connected {
+        /// Hex-encoded service_digest (SHA-256 of the auth token). Persisted
+        /// alongside the uuid so the binding survives kdcts restarts and the
+        /// uuid-claim check can be enforced.
+        service_digest: String,
         hostname: String,
         os: String,
         arch: String,

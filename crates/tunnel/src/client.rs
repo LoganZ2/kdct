@@ -36,27 +36,42 @@ struct TrackedContainer {
 struct NodeIdentity;
 
 impl NodeIdentity {
-    fn path() -> PathBuf {
+    fn path() -> Result<PathBuf> {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".kdct").join("node_id")
+            .map_err(|_| anyhow!("neither HOME nor USERPROFILE is set; cannot locate ~/.kdct/node_id"))?;
+        if home.is_empty() {
+            bail!("HOME/USERPROFILE is empty; cannot locate ~/.kdct/node_id");
+        }
+        Ok(PathBuf::from(home).join(".kdct").join("node_id"))
     }
 
     fn load() -> Option<String> {
-        let raw = std::fs::read_to_string(Self::path()).ok()?;
+        let raw = std::fs::read_to_string(Self::path().ok()?).ok()?;
         let s = raw.trim();
         if s.is_empty() { None } else { Some(s.to_string()) }
     }
 
-    fn save(uuid: &str) {
-        let path = Self::path();
+    /// Persist the assigned uuid. Returns an error if writing fails — callers
+    /// must treat this as fatal, because a client that runs without a stable
+    /// persisted uuid will be assigned a fresh one on every reconnect and
+    /// silently spawn orphan rows in the server's DB.
+    fn save(uuid: &str) -> Result<()> {
+        let path = Self::path()?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        if let Err(e) = std::fs::write(&path, uuid) {
-            warn!("Failed to persist node_id at {}: {:#}", path.display(), e);
+        std::fs::write(&path, uuid)
+            .with_context(|| format!("Failed to persist node_id at {}", path.display()))?;
+        // Restrict to owner read/write — the uuid is treated as an identity
+        // claim by the server, so it shouldn't leak to other local users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
+        Ok(())
     }
 }
 
@@ -502,8 +517,15 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         }
                         ControlChannelCmd::AssignNodeUuid { uuid } => {
                             info!("Server assigned node_uuid={}", uuid);
+                            // If we can't persist this, every reconnect will be assigned a
+                            // fresh uuid by the server and quietly orphan DB rows. Make it
+                            // loud so the supervisor surfaces the problem.
+                            if let Err(e) = NodeIdentity::save(&uuid) {
+                                return Err(anyhow!(
+                                    "Cannot persist server-assigned node_uuid: {:#}", e
+                                ));
+                            }
                             *self.node_uuid.lock().unwrap() = Some(uuid.clone());
-                            NodeIdentity::save(&uuid);
                         }
                         ControlChannelCmd::ImageStart { image_tag, source, source_type, container_name, port_map, env } => {
                             let wr = wr.clone();
