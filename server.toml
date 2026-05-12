@@ -23,3 +23,12 @@ api_port = 9933
 # TLS material. Required if you want to enable TLS in the panel toggle.
 # tls_cert_path = "/etc/kdct/cert.pem"
 # tls_key_path  = "/etc/kdct/key.pem"
+
+# Auto-TLS via ACME (Let's Encrypt). When enabled, kdcts manages cert and key
+# itself; tls_cert_path / tls_key_path above are ignored. Requires `domain`,
+# and `http_port` must be reachable from the public internet for HTTP-01.
+# [server.acme]
+# enabled = true
+# email   = "you@example.com"
+# staging = false                       # use LE staging while testing
+# state_dir = "kdct-state/acme/app.example.com"
