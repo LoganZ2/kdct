@@ -13,16 +13,23 @@ pub type SyncedCallback = Mutex<Option<ForwardCallback>>;
 /// share a hostname (or a service name in client.toml) no longer collide.
 pub type NodeUuid = String;
 
-/// `service_digest` (hex) → `node_uuid`. The server uses this to verify uuid
-/// claims: once a digest is bound to a uuid, only that uuid is accepted from
-/// clients authenticating with the same digest. This prevents same-token
-/// clients from spoofing each other's identity by editing `~/.kdct/node_id`.
+/// `node_uuid → service_digest_hex`. The server uses this to verify uuid
+/// claims:
 ///
-/// The map is loaded from SQLite at kdcts startup and updated in-memory when
-/// a new binding is created; the persisted row is written via the existing
-/// `NodeEvent::Connected` → `upsert_node` path (which now carries the
-/// `service_digest` alongside the uuid).
-pub type NodeBindings = Arc<RwLock<HashMap<String, NodeUuid>>>;
+/// - A claim of a uuid bound to a *different* digest is rejected (blocks
+///   cross-token spoofing).
+/// - A claim of a uuid bound to *our* digest is accepted.
+/// - A claim of a uuid that no digest owns is accepted and recorded.
+/// - A client that claims nothing gets an *offline* uuid bound to its
+///   digest restored (file-loss recovery), or a fresh uuid if all bound
+///   uuids for that digest are currently online (so a second machine
+///   sharing the token gets its own identity).
+///
+/// One digest can own multiple uuids — that's how two machines using the
+/// same token coexist. Loaded from SQLite at kdcts startup; new entries
+/// are persisted via the existing `NodeEvent::Connected` → `upsert_node`
+/// path.
+pub type NodeBindings = Arc<RwLock<HashMap<NodeUuid, String>>>;
 
 pub fn new_bindings() -> NodeBindings {
     Arc::new(RwLock::new(HashMap::new()))
