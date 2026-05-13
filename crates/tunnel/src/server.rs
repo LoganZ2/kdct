@@ -25,6 +25,11 @@ use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span}
 
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
+/// Per-connection identifier for the control_channels map. Different from
+/// `service_digest` (which is the SHA-256 of the auth token and is shared
+/// across all clients using that token) so two clients on the same token
+/// can both have entries.
+type ChannelId = protocol::Digest;
 
 const TCP_POOL_SIZE: usize = 8;
 const UDP_POOL_SIZE: usize = 2;
@@ -50,12 +55,19 @@ pub async fn run_server(
     Ok(())
 }
 
-type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
+type ControlChannelMap<T> = MultiMap<ChannelId, Nonce, ControlChannelHandle<T>>;
+
+/// `node_uuid → channel_id` for the currently-serving channel of each
+/// machine. Used to evict a stale control channel when its machine
+/// reconnects (and to confirm at cleanup time that we're removing our own
+/// entry, not a newer reconnect's).
+type UuidIndex = Arc<RwLock<HashMap<String, ChannelId>>>;
 
 pub struct Server<T: Transport> {
     config: Arc<ServerConfig>,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    uuid_index: UuidIndex,
     transport: Arc<T>,
     pub clients: ClientRegistry,
     pub bindings: crate::registry::NodeBindings,
@@ -83,6 +95,7 @@ impl<T: 'static + Transport> Server<T> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let uuid_index: UuidIndex = Arc::new(RwLock::new(HashMap::new()));
         let transport_cfg = TransportConfig { transport_type: TransportType::Tcp, tcp: TcpConfig::default() };
         let transport = Arc::new(T::new(&transport_cfg)?);
         let clients = registry::new_registry();
@@ -90,6 +103,7 @@ impl<T: 'static + Transport> Server<T> {
             config,
             services,
             control_channels,
+            uuid_index,
             transport,
             clients,
             bindings,
@@ -139,13 +153,14 @@ impl<T: 'static + Transport> Server<T> {
                                         Ok(conn) => {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
+                                            let uuid_index = self.uuid_index.clone();
                                             let server_config = self.config.clone();
                                             let clients = self.clients.clone();
                                             let bindings = self.bindings.clone();
                                             let port_pool = self.port_pool.clone();
                                             let node_update_tx = self.node_update_tx.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, clients, bindings, port_pool, node_update_tx).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, uuid_index, server_config, clients, bindings, port_pool, node_update_tx).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -178,6 +193,7 @@ async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    uuid_index: UuidIndex,
     server_config: Arc<ServerConfig>,
     clients: ClientRegistry,
     bindings: crate::registry::NodeBindings,
@@ -191,6 +207,7 @@ async fn handle_connection<T: 'static + Transport>(
                 conn,
                 services,
                 control_channels,
+                uuid_index,
                 service_digest,
                 server_config,
                 clients,
@@ -211,6 +228,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     mut conn: T::Stream,
     _services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    uuid_index: UuidIndex,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
     clients: ClientRegistry,
@@ -250,11 +268,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     let service_name = hex::encode(service_digest);
 
-    let mut h = control_channels.write().await;
-
-    if h.remove1(&service_digest).is_some() {
-        warn!("Dropping previous control channel for {}", service_name);
-    }
+    // Per-connection channel id — different from `service_digest` so two
+    // clients authenticating with the same token can both have entries in
+    // `control_channels`. Eviction of stale entries happens later, by
+    // node_uuid, after ReportNodeStatus tells us which machine this is.
+    let mut channel_id = [0u8; HASH_WIDTH_IN_BYTES];
+    rand::rng().fill_bytes(&mut channel_id);
 
     protocol::write_ack(&mut conn, &Ack::Ok).await?;
 
@@ -267,11 +286,23 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         nodelay: None,
     };
 
-    info!(service = %service_name, "Control channel established");
-    let handle =
-        ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval, clients, bindings, service_digest, port_pool, node_update_tx);
+    info!(service = %service_name, channel_id = %hex::encode(channel_id), "Control channel established");
+    let handle = ControlChannelHandle::new(
+        conn,
+        service_config,
+        server_config.heartbeat_interval,
+        clients,
+        bindings,
+        service_digest,
+        channel_id,
+        control_channels.clone(),
+        uuid_index,
+        port_pool,
+        node_update_tx,
+    );
 
-    let _ = h.insert(service_digest, session_key, handle);
+    let mut h = control_channels.write().await;
+    let _ = h.insert(channel_id, session_key, handle);
 
     Ok(())
 }
@@ -360,6 +391,9 @@ where
         clients: ClientRegistry,
         bindings: crate::registry::NodeBindings,
         service_digest: ServiceDigest,
+        channel_id: ChannelId,
+        control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+        uuid_index: UuidIndex,
         port_pool: Option<Arc<crate::port_pool::PortPool>>,
         node_update_tx: mpsc::Sender<crate::node_update::NodeUpdate>,
     ) -> ControlChannelHandle<T> {
@@ -393,6 +427,8 @@ where
         let shutdown_tx_clone = shutdown_tx.clone();
         let digest_for_drop = service_digest;
         let clients_for_drop = clients.clone();
+        let control_channels_for_drop = control_channels.clone();
+        let uuid_index_for_drop = uuid_index.clone();
 
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
@@ -448,8 +484,11 @@ where
             cmd_tx: cmd_tx_for_registry,
             service_digest: digest_for_drop,
             service_name,
+            channel_id,
             clients,
             bindings,
+            uuid_index: uuid_index.clone(),
+            control_channels: control_channels.clone(),
             port_data_pending: port_data_pending.clone(),
             port_data_callbacks: port_data_callbacks.clone(),
             port_pool,
@@ -470,8 +509,18 @@ where
                 let _ = shutdown_tx_clone.send(true);
                 let uuid = node_uuid_slot.lock().await.clone();
                 if let Some(uuid) = uuid {
+                    // Only clear the uuid_index entry if it's still ours —
+                    // a newer reconnect for the same uuid may have taken over.
+                    let mut idx = uuid_index_for_drop.write().await;
+                    if idx.get(&uuid).copied() == Some(channel_id) {
+                        idx.remove(&uuid);
+                    }
+                    drop(idx);
                     registry::remove(&clients_for_drop, &uuid).await;
                 }
+                // Always drop our control_channels entry — keyed by our
+                // unique channel_id, so this can't clobber anyone else.
+                let _ = control_channels_for_drop.write().await.remove1(&channel_id);
             }
             .instrument(Span::current()),
         );
@@ -498,8 +547,17 @@ struct ControlChannel<T: Transport> {
     #[allow(dead_code)]
     service_digest: ServiceDigest,
     service_name: String,
+    /// Per-connection identifier — primary key in `control_channels`. Lets
+    /// us evict the *previous* channel for a given node_uuid (same machine
+    /// reconnecting) without disturbing channels from other machines that
+    /// happen to share the same auth token.
+    channel_id: ChannelId,
     clients: ClientRegistry,
     bindings: crate::registry::NodeBindings,
+    uuid_index: UuidIndex,
+    /// Map of all control channels (keyed by channel_id). Held so we can
+    /// evict a peer entry — used when a same-uuid reconnect comes in.
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     port_data_pending: Arc<RwLock<VecDeque<(oneshot::Sender<T::Stream>, u16)>>>,
     port_data_callbacks: Arc<RwLock<VecDeque<(crate::registry::SyncedCallback, u16)>>>,
     port_pool: Option<Arc<crate::port_pool::PortPool>>,
@@ -534,12 +592,15 @@ impl<T: Transport> ControlChannel<T> {
                         Ok(ControlChannelCmd::ReportNodeStatus { node_uuid, hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers }) => {
                             // Resolve the uuid this client should be known as.
                             //
-                            // Bindings (`service_digest → node_uuid`) gate spoofing: once a
-                            // digest is bound, only that uuid is accepted from a client that
-                            // authenticates with the same digest. A claim that mismatches the
-                            // binding is overridden with the bound uuid via AssignNodeUuid.
-                            // A claim of a uuid currently bound to a *different* digest is
-                            // rejected and a fresh uuid is issued.
+                            // `bindings: node_uuid → service_digest_hex`.
+                            //   * A claim of a uuid that's bound to a *different* digest is
+                            //     rejected (cross-token spoof protection).
+                            //   * A claim of a uuid bound to *our* digest, or to nobody, is
+                            //     accepted.
+                            //   * No claim + we have an *offline* bound uuid → restore it
+                            //     (file-loss recovery).
+                            //   * No claim + all our bound uuids are currently online (i.e.
+                            //     a second machine sharing the same token) → fresh uuid.
                             let digest_hex = hex::encode(self.service_digest);
                             let claimed = node_uuid.as_deref().and_then(|s| {
                                 let trimmed = s.trim();
@@ -551,51 +612,81 @@ impl<T: Transport> ControlChannel<T> {
                             });
 
                             enum Resolve { Accept(String), AssignAndUse(String) }
-                            let resolved = {
+                            // Snapshot currently-online uuids so the binding decision can
+                            // distinguish "primary machine lost its file" from "second
+                            // machine sharing the token".
+                            let online_uuids: std::collections::HashSet<String> = self
+                                .clients
+                                .read()
+                                .await
+                                .keys()
+                                .cloned()
+                                .collect();
+                            let resolved = if let Some(existing) = self.node_uuid.clone() {
+                                // We've already resolved an identity for this channel —
+                                // a follow-up ReportNodeStatus (e.g., a heartbeat fired
+                                // before the client processed our AssignNodeUuid) must
+                                // not be allowed to drift onto a different uuid.
+                                Resolve::Accept(existing)
+                            } else {
                                 let mut map = self.bindings.write().await;
-                                let bound = map.get(&digest_hex).cloned();
-                                match (claimed, bound) {
-                                    (Some(c), Some(b)) if c == b => Resolve::Accept(c),
-                                    (Some(c), Some(b)) => {
-                                        warn!(
-                                            "Client {} ({}) claimed uuid={} but service_digest is bound to uuid={}; overriding",
-                                            self.service_name, hostname, c, b
-                                        );
-                                        Resolve::AssignAndUse(b)
-                                    }
-                                    (Some(c), None) => {
-                                        if map.values().any(|v| v == &c) {
+                                match claimed {
+                                    Some(c) => match map.get(&c) {
+                                        Some(d) if d == &digest_hex => Resolve::Accept(c),
+                                        Some(d) => {
                                             warn!(
-                                                "Client {} ({}) claimed uuid={} which is bound to another service_digest; issuing a fresh uuid",
-                                                self.service_name, hostname, c
+                                                "Client {} ({}) claimed uuid={} which is bound to a different service_digest ({}); issuing a fresh uuid",
+                                                self.service_name, hostname, c, d
                                             );
                                             let n = uuid::Uuid::new_v4().to_string();
-                                            map.insert(digest_hex.clone(), n.clone());
+                                            map.insert(n.clone(), digest_hex.clone());
                                             Resolve::AssignAndUse(n)
-                                        } else {
+                                        }
+                                        None => {
                                             info!(
-                                                "Binding service_digest={} to client-claimed uuid={} ({})",
-                                                digest_hex, c, hostname
+                                                "Binding uuid={} to service_digest={} ({})",
+                                                c, digest_hex, hostname
                                             );
-                                            map.insert(digest_hex.clone(), c.clone());
+                                            map.insert(c.clone(), digest_hex.clone());
                                             Resolve::Accept(c)
                                         }
-                                    }
-                                    (None, Some(b)) => {
-                                        info!(
-                                            "Restoring uuid={} for {} ({}); client had no persisted node_id",
-                                            b, self.service_name, hostname
-                                        );
-                                        Resolve::AssignAndUse(b)
-                                    }
-                                    (None, None) => {
-                                        let n = uuid::Uuid::new_v4().to_string();
-                                        info!(
-                                            "Assigning uuid={} to {} ({})",
-                                            n, self.service_name, hostname
-                                        );
-                                        map.insert(digest_hex.clone(), n.clone());
-                                        Resolve::AssignAndUse(n)
+                                    },
+                                    None => {
+                                        // File-loss recovery is only safe when a digest
+                                        // owns exactly one bound uuid — otherwise we'd
+                                        // have to guess which machine is which and would
+                                        // get it wrong half the time. For multi-machine
+                                        // (shared-token) deployments, just assign fresh
+                                        // and let the new row sit alongside the orphan.
+                                        let bound_for_digest: Vec<String> = map
+                                            .iter()
+                                            .filter(|(_, d)| *d == &digest_hex)
+                                            .map(|(u, _)| u.clone())
+                                            .collect();
+                                        let solo_offline = match bound_for_digest.as_slice() {
+                                            [only] if !online_uuids.contains(only) => {
+                                                Some(only.clone())
+                                            }
+                                            _ => None,
+                                        };
+                                        match solo_offline {
+                                            Some(u) => {
+                                                info!(
+                                                    "Restoring uuid={} for {} ({}); client had no persisted node_id",
+                                                    u, self.service_name, hostname
+                                                );
+                                                Resolve::AssignAndUse(u)
+                                            }
+                                            None => {
+                                                let n = uuid::Uuid::new_v4().to_string();
+                                                info!(
+                                                    "Assigning uuid={} to {} ({})",
+                                                    n, self.service_name, hostname
+                                                );
+                                                map.insert(n.clone(), digest_hex.clone());
+                                                Resolve::AssignAndUse(n)
+                                            }
+                                        }
                                     }
                                 }
                             };
@@ -615,6 +706,28 @@ impl<T: Transport> ControlChannel<T> {
                             if let Some(prev) = self.node_uuid.as_ref() {
                                 if prev != &uuid {
                                     crate::registry::remove(&self.clients, prev).await;
+                                }
+                            }
+
+                            // Evict any *other* control channel that's currently registered for
+                            // this uuid. This is the per-machine equivalent of the old
+                            // remove-by-service_digest at handshake time: two channels from the
+                            // same machine (e.g., after a network blip + reconnect) shouldn't
+                            // coexist, but two channels from different machines on the same auth
+                            // token should.
+                            let prev_channel_id = {
+                                let mut idx = self.uuid_index.write().await;
+                                let prev = idx.get(&uuid).copied();
+                                idx.insert(uuid.clone(), self.channel_id);
+                                prev
+                            };
+                            if let Some(prev_id) = prev_channel_id {
+                                if prev_id != self.channel_id {
+                                    warn!(
+                                        "Evicting previous control channel for uuid={} (was channel_id={})",
+                                        uuid, hex::encode(prev_id)
+                                    );
+                                    let _ = self.control_channels.write().await.remove1(&prev_id);
                                 }
                             }
 

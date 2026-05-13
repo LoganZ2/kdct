@@ -619,13 +619,15 @@ impl Database {
         Ok(())
     }
 
-    /// Returns `(service_digest_hex → node_uuid)` for every node currently in
-    /// the table. Used to seed the tunnel server's binding map at startup so
-    /// the spoof-prevention check survives kdcts restarts.
+    /// Returns `(node_uuid → service_digest_hex)` for every node currently
+    /// in the table. Seeds the tunnel server's binding map at startup so
+    /// the spoof check survives kdcts restarts. One digest can map to
+    /// multiple uuids — that's how two machines sharing one auth token
+    /// keep distinct identities.
     pub fn load_bindings(&self) -> Result<std::collections::HashMap<String, String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT auth_digest, node_uuid FROM client_nodes \
+            "SELECT node_uuid, auth_digest FROM client_nodes \
              WHERE auth_digest IS NOT NULL AND node_uuid IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |row| {

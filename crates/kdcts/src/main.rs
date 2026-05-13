@@ -282,8 +282,8 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let bindings = tunnel::registry::new_bindings();
             {
                 let mut guard = bindings.write().await;
-                for (digest, uuid) in db.load_bindings().unwrap_or_default() {
-                    guard.insert(digest, uuid);
+                for (uuid, digest) in db.load_bindings().unwrap_or_default() {
+                    guard.insert(uuid, digest);
                 }
                 tracing::info!("Loaded {} node binding(s) from DB", guard.len());
             }
