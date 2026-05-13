@@ -134,7 +134,7 @@ email   = "you@example.com"
 
 **2. Manual.** Set `tls_cert_path` and `tls_key_path` in `[server]`. Flip the TLS toggle in the panel. Restart `kdcts`.
 
-Either way, when TLS is on `kdcts` binds HTTPS on `https_port`, the panel TLS toggle becomes available, and `http_port` is left for `acme` renewals (and a future HTTP→HTTPS redirector). Pingora itself only ever speaks one of the two.
+When TLS is on, `kdcts` serves HTTPS on `https_port` and a 301 redirector on `http_port` — `http://your.domain/x` becomes `https://your.domain/x`. The redirect is unconditional; there's no mixed-mode HTTP+HTTPS. The same `http_port` listener also serves the `/.well-known/acme-challenge/*` path when ACME renewal is running, so HTTPS-redirect and Let's Encrypt renewals coexist on the one port.
 
 ## Reserved paths
 
@@ -189,7 +189,6 @@ kdct/
 
 - **Panel has optional basic auth.** Set `admin_user` and `admin_password` in `server.toml` to protect `/admin/` with HTTP Basic Authentication. Not required, but recommended for production.
 - **Nodes are keyed by stable per-machine UUID.** Assigned by the server on first connect, persisted at `~/.kdct/node_id` on the client (0o600). Two machines sharing one auth token coexist — each gets its own uuid. A client that loses its `node_id` file recovers the same uuid only when the auth token is otherwise unused; with multiple machines on one token the recovery is ambiguous, so a fresh uuid is assigned and the orphan row stays in the DB until you delete it from the panel. A client trying to claim a uuid bound to a *different* auth token gets rejected.
-- **No HTTP→HTTPS redirect.** TLS-on means HTTP is gone; if you want both, terminate elsewhere.
 
 ## License
 

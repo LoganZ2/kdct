@@ -33,12 +33,21 @@ const LE_DIRECTORY_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org
 /// Renew when fewer than this many days of validity remain.
 const RENEW_WITHIN_DAYS: i64 = 30;
 
+/// Shared challenge map: `token → key_authorization`. Populated by the ACME
+/// order flow, drained by whichever HTTP listener owns `http_port` — either
+/// the temporary one we spin up at startup, or the always-on HTTPS-redirect
+/// listener in `proxy.rs` once Pingora is up.
+pub type ChallengeMap = Arc<RwLock<HashMap<String, String>>>;
+
 #[derive(Clone)]
 pub struct AcmeManager {
     pub domain: String,
     pub email: String,
     pub directory_url: String,
     pub state_dir: PathBuf,
+    /// Active ACME-01 challenges. Shared with the proxy's HTTPS-redirect
+    /// listener so renewals can run while Pingora holds `https_port`.
+    pub challenges: ChallengeMap,
 }
 
 impl AcmeManager {
@@ -68,7 +77,13 @@ impl AcmeManager {
                 .map(|d| d.join(&state_dir_raw))
                 .unwrap_or(state_dir_raw)
         };
-        Ok(Self { domain: domain.to_string(), email, directory_url, state_dir })
+        Ok(Self {
+            domain: domain.to_string(),
+            email,
+            directory_url,
+            state_dir,
+            challenges: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     pub fn cert_path(&self) -> PathBuf { self.state_dir.join("cert.pem") }
@@ -97,10 +112,13 @@ impl AcmeManager {
         }
     }
 
-    /// Run the ACME flow against the configured directory. Binds `http_port`
-    /// for the duration of the flow to serve HTTP-01 challenges, then drops
-    /// the listener.
-    pub async fn obtain_or_renew(&self, http_port: u16) -> Result<()> {
+    /// Issue or renew the cert. At startup (before Pingora has bound
+    /// `http_port`) the caller passes `Some(http_port)` and we bring up our
+    /// own challenge listener for the duration of the flow. For background
+    /// renewals (when the proxy's HTTPS-redirect listener already owns
+    /// `http_port`), the caller passes `None`; we write challenges into the
+    /// shared `self.challenges` map and the redirect listener serves them.
+    pub async fn obtain_or_renew(&self, http_port: Option<u16>) -> Result<()> {
         tokio::fs::create_dir_all(&self.state_dir)
             .await
             .with_context(|| format!("Failed to create ACME state dir {}", self.state_dir.display()))?;
@@ -116,8 +134,42 @@ impl AcmeManager {
             .await;
         }
 
-        let challenges: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        // Always start with an empty challenge set for this flow.
+        self.challenges.write().await.clear();
 
+        // Bring up a one-off challenge listener iff the caller didn't tell us
+        // someone else (the proxy redirect listener) already owns http_port.
+        let listener_stop = match http_port {
+            Some(port) => Some(self.spawn_challenge_listener(port).await?),
+            None => {
+                info!("ACME challenge requests will be served by the existing HTTPS-redirect listener");
+                None
+            }
+        };
+
+        let result = match timeout(
+            Duration::from_secs(120),
+            self.run_acme_flow(self.challenges.clone()),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => Err(anyhow!("ACME flow timed out after 2 minutes")),
+        };
+
+        if let Some((stop_tx, handle)) = listener_stop {
+            let _ = stop_tx.send(());
+            let _ = handle.await;
+        }
+        // Once the order is done, no need to keep the tokens hanging around.
+        self.challenges.write().await.clear();
+        result
+    }
+
+    async fn spawn_challenge_listener(
+        &self,
+        http_port: u16,
+    ) -> Result<(tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
         let listen_addr = format!("0.0.0.0:{}", http_port);
         let listener = TcpListener::bind(&listen_addr)
             .await
@@ -125,10 +177,9 @@ impl AcmeManager {
         info!("ACME challenge listener on {}", listen_addr);
 
         let conn_semaphore: Arc<Semaphore> = Arc::new(Semaphore::new(64));
-
-        let challenges_for_task = challenges.clone();
+        let challenges_for_task = self.challenges.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let listener_handle = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     accept = listener.accept() => {
@@ -143,23 +194,14 @@ impl AcmeManager {
                                     }
                                 });
                             }
-                            Err(e) => {
-                                warn!("ACME accept error: {:#}", e);
-                            }
+                            Err(e) => warn!("ACME accept error: {:#}", e),
                         }
                     }
                     _ = &mut stop_rx => break,
                 }
             }
         });
-
-        let result = match timeout(Duration::from_secs(120), self.run_acme_flow(challenges)).await {
-            Ok(inner) => inner,
-            Err(_) => Err(anyhow!("ACME flow timed out after 2 minutes")),
-        };
-        let _ = stop_tx.send(());
-        let _ = listener_handle.await;
-        result
+        Ok((stop_tx, handle))
     }
 
     async fn run_acme_flow(&self, challenges: Arc<RwLock<HashMap<String, String>>>) -> Result<()> {
@@ -308,7 +350,7 @@ impl AcmeManager {
 /// New cert bytes are written to disk; the running Pingora keeps using its
 /// in-memory copy until the next restart. For LE this is a 60+ day window
 /// after renewal completes — plenty of lead time.
-pub fn spawn_renewal_task(manager: Arc<AcmeManager>, http_port: u16) {
+pub fn spawn_renewal_task(manager: Arc<AcmeManager>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(86400));
         // Skip the first immediate tick — we just issued at startup.
@@ -324,7 +366,11 @@ pub fn spawn_renewal_task(manager: Arc<AcmeManager>, http_port: u16) {
             } else {
                 warn!("ACME cert is unreadable on disk — attempting fresh issuance");
             }
-            match manager.obtain_or_renew(http_port).await {
+            // At renewal time the proxy's HTTPS-redirect listener owns
+            // http_port and will serve `/.well-known/acme-challenge/*` from
+            // `manager.challenges`. Pass `None` so we don't try to bind it
+            // ourselves.
+            match manager.obtain_or_renew(None).await {
                 Ok(()) => {
                     info!("ACME cert renewed successfully — restarting to apply");
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -338,7 +384,7 @@ pub fn spawn_renewal_task(manager: Arc<AcmeManager>, http_port: u16) {
 
 async fn serve_challenge(
     mut sock: tokio::net::TcpStream,
-    challenges: Arc<RwLock<HashMap<String, String>>>,
+    challenges: ChallengeMap,
 ) -> Result<()> {
     let mut buf = [0u8; 4096];
     let mut filled = 0usize;

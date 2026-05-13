@@ -186,7 +186,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                     mgr.domain,
                     mgr.state_dir.display()
                 );
-                if let Err(e) = mgr.obtain_or_renew(http_port).await {
+                // Pingora isn't up yet, so own http_port for the
+                // duration of the flow.
+                if let Err(e) = mgr.obtain_or_renew(Some(http_port)).await {
                     tracing::error!("ACME initial issuance failed: {:#}", e);
                 }
             } else if let Some(days) = mgr.cert_days_remaining() {
@@ -246,10 +248,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     };
 
     // Spawn renewal task once TLS is up. Runs once a day; only acts when
-    // <30 days remain on the on-disk cert.
+    // <30 days remain. The proxy's HTTPS-redirect listener serves the
+    // ACME challenge path from the shared `mgr.challenges` map, so we
+    // don't need to hand the renewal task a port to bind.
     if tls_live {
         if let Some(mgr) = acme_manager.clone() {
-            acme::spawn_renewal_task(mgr, http_port);
+            acme::spawn_renewal_task(mgr);
         }
     }
 
@@ -363,6 +367,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             // Pingora reverse proxy
             let proxy_rt = route_table.clone();
             let proxy_domain = domain.clone();
+            let proxy_acme_challenges = acme_manager.as_ref().map(|m| m.challenges.clone());
             tokio::spawn(async move {
                 if let Err(e) = proxy::run_proxy(
                     proxy_rt,
@@ -371,6 +376,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                     http_port,
                     https_port,
                     tls_for_proxy,
+                    proxy_acme_challenges,
                 )
                 .await
                 {
