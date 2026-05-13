@@ -1,4 +1,4 @@
-use crate::protocol::{ContainerInfo, ControlChannelCmd, Digest};
+use crate::protocol::{ContainerInfo, ControlChannelCmd};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -8,8 +8,28 @@ use tracing::info;
 pub type ForwardCallback = Box<dyn FnOnce(Box<dyn std::any::Any + Send>) + Send>;
 pub type SyncedCallback = Mutex<Option<ForwardCallback>>;
 
+/// Stable per-machine identifier assigned by the server on first connect and
+/// persisted by the client. Used as the registry key so two machines that
+/// share a hostname (or a service name in client.toml) no longer collide.
+pub type NodeUuid = String;
+
+/// `service_digest` (hex) → `node_uuid`. The server uses this to verify uuid
+/// claims: once a digest is bound to a uuid, only that uuid is accepted from
+/// clients authenticating with the same digest. This prevents same-token
+/// clients from spoofing each other's identity by editing `~/.kdct/node_id`.
+///
+/// The map is loaded from SQLite at kdcts startup and updated in-memory when
+/// a new binding is created; the persisted row is written via the existing
+/// `NodeEvent::Connected` → `upsert_node` path (which now carries the
+/// `service_digest` alongside the uuid).
+pub type NodeBindings = Arc<RwLock<HashMap<String, NodeUuid>>>;
+
+pub fn new_bindings() -> NodeBindings {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 pub struct ClientEntry {
-    pub service_name: String,
+    pub node_uuid: NodeUuid,
     pub hostname: String,
     pub os: String,
     pub arch: String,
@@ -25,7 +45,7 @@ pub struct ClientEntry {
     pub port_data_callbacks: Arc<RwLock<VecDeque<(SyncedCallback, u16)>>>,
 }
 
-pub type ClientRegistry = Arc<RwLock<HashMap<Digest, ClientEntry>>>;
+pub type ClientRegistry = Arc<RwLock<HashMap<NodeUuid, ClientEntry>>>;
 
 pub fn new_registry() -> ClientRegistry {
     Arc::new(RwLock::new(HashMap::new()))
@@ -33,8 +53,7 @@ pub fn new_registry() -> ClientRegistry {
 
 pub async fn upsert(
     registry: &ClientRegistry,
-    digest: Digest,
-    service_name: String,
+    node_uuid: NodeUuid,
     hostname: String,
     os: String,
     arch: String,
@@ -50,11 +69,11 @@ pub async fn upsert(
     port_data_callbacks: Arc<RwLock<VecDeque<(SyncedCallback, u16)>>>,
 ) {
     let mut guard = registry.write().await;
-    let is_new = !guard.contains_key(&digest);
+    let is_new = !guard.contains_key(&node_uuid);
     guard.insert(
-        digest,
+        node_uuid.clone(),
         ClientEntry {
-            service_name: service_name.clone(),
+            node_uuid: node_uuid.clone(),
             hostname,
             os,
             arch,
@@ -71,12 +90,12 @@ pub async fn upsert(
         },
     );
     if is_new {
-        info!("Client registered: {}", service_name);
+        info!("Client registered: {}", node_uuid);
     }
 }
 
-pub async fn remove(registry: &ClientRegistry, digest: &Digest) {
-    if let Some(entry) = registry.write().await.remove(digest) {
-        info!("Client disconnected: {}", entry.service_name);
+pub async fn remove(registry: &ClientRegistry, node_uuid: &str) {
+    if let Some(entry) = registry.write().await.remove(node_uuid) {
+        info!("Client disconnected: {} ({})", entry.node_uuid, entry.hostname);
     }
 }

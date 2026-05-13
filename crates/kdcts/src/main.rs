@@ -277,9 +277,24 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             let (node_update_tx, mut node_update_rx) =
                 tokio::sync::mpsc::channel::<tunnel::node_update::NodeUpdate>(1024);
 
-            let mut server =
-                Server::<TcpTransport>::from(server_config.clone(), Some(pool.clone()), node_update_tx)
-                    .await?;
+            // Seed the tunnel server's binding map (service_digest → node_uuid)
+            // from SQLite so the spoof-prevention check survives restarts.
+            let bindings = tunnel::registry::new_bindings();
+            {
+                let mut guard = bindings.write().await;
+                for (digest, uuid) in db.load_bindings().unwrap_or_default() {
+                    guard.insert(digest, uuid);
+                }
+                tracing::info!("Loaded {} node binding(s) from DB", guard.len());
+            }
+
+            let mut server = Server::<TcpTransport>::from(
+                server_config.clone(),
+                Some(pool.clone()),
+                node_update_tx,
+                bindings,
+            )
+            .await?;
             let clients = server.clients.clone();
             let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -296,10 +311,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             tokio::spawn(async move {
                 while let Some(update) = node_update_rx.recv().await {
                     match update.event {
-                        NodeEvent::Connected { hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers: _ } => {
+                        NodeEvent::Connected { service_digest, hostname, os, arch, docker_version, port_range_start, port_range_end, cpu_cores, memory_mb, running_containers: _ } => {
                             if let Ok(d) = Database::open(&sync_db_path) {
                                 let _ = d.upsert_node(
-                                    &update.digest,
+                                    &update.uuid,
+                                    &service_digest,
                                     &hostname, &os, &arch,
                                     &docker_version,
                                     port_range_start as i64,
@@ -313,14 +329,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                         NodeEvent::Disconnected { hostname: _ } => {
                             if let Ok(d) = Database::open(&sync_db_path) {
                                 // Mark connections as pending for this node
-                                d.set_node_offline(&update.digest);
-                                // Find node_id from digest
-                                if let Ok(nodes) = d.list_nodes() {
-                                    if let Some(node) = nodes.iter().find(|n| n.auth_digest.as_deref() == Some(&update.digest)) {
-                                        if let Ok(conn_ids) = d.get_connection_ids_for_node(node.id) {
-                                            for cid in conn_ids {
-                                                let _ = d.update_connection_node(cid, Some(node.id), "pending", None);
-                                            }
+                                let _ = d.set_node_offline(&update.uuid);
+                                if let Ok(Some(node)) = d.get_node_by_uuid(&update.uuid) {
+                                    if let Ok(conn_ids) = d.get_connection_ids_for_node(node.id) {
+                                        for cid in conn_ids {
+                                            let _ = d.update_connection_node(cid, Some(node.id), "pending", None);
                                         }
                                     }
                                 }
@@ -329,7 +342,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                                 &sync_tracker,
                                 &sync_rt,
                                 &sync_pool,
-                                &update.digest,
+                                &update.uuid,
                             ).await;
                         }
                         NodeEvent::ContainerStarted { container_name, ports } => {

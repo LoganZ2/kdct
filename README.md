@@ -188,7 +188,7 @@ kdct/
 ## Caveats
 
 - **Panel has optional basic auth.** Set `admin_user` and `admin_password` in `server.toml` to protect `/admin/` with HTTP Basic Authentication. Not required, but recommended for production.
-- **Hostname collision.** Nodes are keyed by SHA-256 auth digest, but the registry also indexes by hostname. Two clients sharing a hostname currently collide.
+- **One control channel per auth token.** Nodes are keyed by a stable per-machine UUID (assigned by the server, persisted at `~/.kdct/node_id` on the client), so two machines no longer collide on hostname. But the control-channel map is still keyed by the auth token's digest — two clients using the same token will keep evicting each other. Give each client its own token (or its own `[client.services.*]` name) if you want them both online.
 
 ## License
 

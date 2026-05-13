@@ -138,6 +138,7 @@ pub async fn run_api(
                                 "port_range_start": n.port_range_start, "port_range_end": n.port_range_end,
                                 "cpu_cores": n.cpu_cores, "memory_mb": n.memory_mb,
                                 "status": n.status, "last_seen": n.last_seen,
+                                "node_uuid": n.node_uuid,
                             })).collect();
                             respond_json(&json!(list))
                         }
