@@ -118,11 +118,23 @@ KDCT splits a deployment into three reusable pieces, joined by a connection:
 
 ## TLS
 
-Requires `domain` plus `tls_cert_path` and `tls_key_path` pointing at a real cert and key. When all three are present, the **TLS toggle** in the panel's settings becomes available. Flip it on, restart `kdcts`, done.
+Two ways to get a cert:
 
-When TLS is on, `kdcts` serves HTTPS on `https_port` and a 301 redirector on `http_port` — `http://your.domain/x` becomes `https://your.domain/x`. The redirect is unconditional; there's no mixed-mode HTTP+HTTPS.
+**1. Auto (Let's Encrypt).** Add `[server.acme]`:
 
-No ACME / Let's Encrypt automation; bring your own cert.
+```toml
+[server.acme]
+enabled = true
+email   = "you@example.com"
+# staging = true               # use LE staging while testing
+# state_dir = "kdct-state/acme/your.domain"
+```
+
+`kdcts` issues a cert via HTTP-01 on startup, persists it under `state_dir`, flips the TLS toggle on, and renews automatically when fewer than 30 days remain (Pingora picks the new cert up on next restart). `domain` is required, and `http_port` must be reachable from the public internet for the challenge.
+
+**2. Manual.** Set `tls_cert_path` and `tls_key_path` in `[server]`. Flip the TLS toggle in the panel. Restart `kdcts`.
+
+When TLS is on, `kdcts` serves HTTPS on `https_port` and a 301 redirector on `http_port` — `http://your.domain/x` becomes `https://your.domain/x`. The redirect is unconditional; there's no mixed-mode HTTP+HTTPS. The same `http_port` listener also serves the `/.well-known/acme-challenge/*` path when ACME renewal is running, so HTTPS-redirect and Let's Encrypt renewals coexist on the one port.
 
 ## Reserved paths
 

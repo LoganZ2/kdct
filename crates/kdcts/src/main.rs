@@ -1,3 +1,4 @@
+mod acme;
 mod api;
 mod db;
 mod deploy;
@@ -16,6 +17,30 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::{broadcast, RwLock};
 use tracing_subscriber::EnvFilter;
+
+/// Replace the current process image with a fresh copy of ourselves
+/// (same exe, same argv). Uses Unix `execv` so the PID is preserved —
+/// systemd / openrc / runit / nohup all keep their supervisor handle.
+/// A plain `spawn` + `exit` would orphan the new process and break
+/// `Type=simple` units that expect the tracked PID to stay alive.
+pub(crate) fn self_restart() -> ! {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().expect("current_exe");
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let err = std::process::Command::new(&exe).args(&args).exec();
+    // `exec` only returns on failure.
+    tracing::error!("Failed to exec kdcts: {}", err);
+    std::process::exit(1);
+}
+
+/// Spawn a background thread that waits 500ms (so the HTTP response has
+/// time to flush) and then `exec`s a fresh copy of ourselves in place.
+pub(crate) fn delayed_restart() {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        self_restart();
+    });
+}
 
 use crate::db::Database;
 use crate::proxy::RouteTable;
@@ -87,25 +112,125 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     let db = Database::open(&db_path)?;
 
-    // Resolve TLS configuration: persisted toggle in DB + cert/key paths from
-    // config. TLS additionally requires a configured `domain` — without one,
-    // there's no name to bind a certificate to.
-    let tls_paths_ok = match (
-        server_config.tls_cert_path.as_deref(),
-        server_config.tls_key_path.as_deref(),
-    ) {
+    // ACME / Let's Encrypt auto-TLS. When enabled, replaces the manual
+    // tls_cert_path / tls_key_path with files we manage under a state dir.
+    //
+    // Precedence: if the panel has ever written ACME settings to the DB
+    // (key `acme_enabled` present, regardless of value), the DB owns the
+    // config — that way disabling via the panel actually disables ACME
+    // even if server.toml still has `[server.acme] enabled = true`. If
+    // the panel has never touched these settings, server.toml wins.
+    // `directory_url` is only configurable from server.toml since the
+    // panel doesn't expose it; we carry it forward in DB-mode.
+    let db_acme_present = matches!(db.get_setting("acme_enabled"), Ok(Some(_)));
+    let acme_cfg = if db_acme_present {
+        let toml_base = server_config.acme.clone().unwrap_or_default();
+        let enabled = db
+            .get_setting("acme_enabled")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let email = db
+            .get_setting("acme_email")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .or(toml_base.email);
+        let staging = db
+            .get_setting("acme_staging")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(toml_base.staging);
+        let state_dir = db
+            .get_setting("acme_state_dir")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .or(toml_base.state_dir);
+        Some(tunnel::config::AcmeConfig {
+            enabled,
+            email,
+            staging,
+            directory_url: toml_base.directory_url,
+            state_dir,
+        })
+    } else {
+        server_config.acme.clone()
+    };
+    let acme_manager: Option<Arc<acme::AcmeManager>> = match (&domain, &acme_cfg) {
+        (Some(d), Some(cfg)) if cfg.enabled => match acme::AcmeManager::from_config(d, cfg) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                tracing::error!("ACME config rejected: {:#}", e);
+                None
+            }
+        },
+        (None, Some(cfg)) if cfg.enabled => {
+            tracing::error!(
+                "acme.enabled = true requires `domain` to be set in server.toml"
+            );
+            None
+        }
+        _ => None,
+    };
+
+    // If ACME is on, run the issuance/renewal flow before Pingora binds.
+    // After a successful flow, override the cert/key paths used by Pingora.
+    let (tls_cert_path_eff, tls_key_path_eff) = match &acme_manager {
+        Some(mgr) => {
+            if mgr.cert_needs_issue_or_renew() {
+                tracing::info!(
+                    "Obtaining TLS cert via ACME for {} (state dir: {})",
+                    mgr.domain,
+                    mgr.state_dir.display()
+                );
+                // Pingora isn't up yet, so own http_port for the
+                // duration of the flow.
+                if let Err(e) = mgr.obtain_or_renew(Some(http_port)).await {
+                    tracing::error!("ACME initial issuance failed: {:#}", e);
+                }
+            } else if let Some(days) = mgr.cert_days_remaining() {
+                tracing::info!(
+                    "Reusing on-disk ACME cert for {} ({} days remaining)",
+                    mgr.domain,
+                    days
+                );
+            }
+            let cert = mgr.cert_path().to_string_lossy().to_string();
+            let key = mgr.key_path().to_string_lossy().to_string();
+            (Some(cert), Some(key))
+        }
+        None => (
+            server_config.tls_cert_path.clone(),
+            server_config.tls_key_path.clone(),
+        ),
+    };
+
+    // Resolve TLS configuration: persisted toggle in DB + cert/key paths
+    // (either from acme manager or from config). TLS additionally requires
+    // a configured `domain`.
+    let tls_paths_ok = match (tls_cert_path_eff.as_deref(), tls_key_path_eff.as_deref()) {
         (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => {
             std::path::Path::new(c).is_file() && std::path::Path::new(k).is_file()
         }
         _ => false,
     };
     let tls_configurable = domain.is_some() && tls_paths_ok;
-    let tls_persisted = db
+    // ACME implies the user wants TLS. If ACME is enabled and our paths are
+    // good, force the toggle on so the user doesn't need to flip it manually.
+    let mut tls_persisted = db
         .get_setting("tls_enabled")
         .ok()
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
+    if acme_manager.is_some() && tls_paths_ok && !tls_persisted {
+        tls_persisted = true;
+        let _ = db.set_setting("tls_enabled", "true");
+        tracing::info!("ACME enabled — turning on persisted TLS toggle");
+    }
     let tls_live = tls_persisted && tls_configurable;
     if tls_persisted && !tls_configurable {
         tracing::warn!(
@@ -115,12 +240,22 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     }
     let tls_for_proxy = if tls_live {
         Some(crate::proxy::TlsConfig {
-            cert_path: server_config.tls_cert_path.clone().unwrap_or_default(),
-            key_path: server_config.tls_key_path.clone().unwrap_or_default(),
+            cert_path: tls_cert_path_eff.clone().unwrap_or_default(),
+            key_path: tls_key_path_eff.clone().unwrap_or_default(),
         })
     } else {
         None
     };
+
+    // Spawn renewal task once TLS is up. Runs once a day; only acts when
+    // <30 days remain. The proxy's HTTPS-redirect listener serves the
+    // ACME challenge path from the shared `mgr.challenges` map, so we
+    // don't need to hand the renewal task a port to bind.
+    if tls_live {
+        if let Some(mgr) = acme_manager.clone() {
+            acme::spawn_renewal_task(mgr);
+        }
+    }
 
     let route_table = Arc::new(RwLock::new(RouteTable::new()));
 
@@ -219,6 +354,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             // Pingora reverse proxy
             let proxy_rt = route_table.clone();
             let proxy_domain = domain.clone();
+            let proxy_acme_challenges = acme_manager.as_ref().map(|m| m.challenges.clone());
             tokio::spawn(async move {
                 if let Err(e) = proxy::run_proxy(
                     proxy_rt,
@@ -227,6 +363,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                     http_port,
                     https_port,
                     tls_for_proxy,
+                    proxy_acme_challenges,
                 )
                 .await
                 {

@@ -152,6 +152,7 @@ pub async fn run_proxy(
     http_port: u16,
     https_port: u16,
     tls: Option<TlsConfig>,
+    acme_challenges: Option<crate::acme::ChallengeMap>,
 ) -> anyhow::Result<()> {
     let proxy = KdctProxy {
         route_table,
@@ -182,11 +183,16 @@ pub async fn run_proxy(
 
     // When TLS is on, also bind http_port and 301 every request to https.
     // This is hardcoded — a server with TLS enabled never serves plain HTTP.
+    // The same listener also serves `/.well-known/acme-challenge/*` so
+    // background ACME renewals can run without fighting us for http_port.
     if tls_on {
         let redirect_addr = format!("0.0.0.0:{}", http_port);
         let redirect_https_port = https_port;
+        let challenges = acme_challenges.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_https_redirect(&redirect_addr, redirect_https_port).await {
+            if let Err(e) =
+                run_https_redirect(&redirect_addr, redirect_https_port, challenges).await
+            {
                 error!("HTTPS redirect listener exited: {:#}", e);
             }
         });
@@ -215,7 +221,11 @@ pub async fn run_proxy(
 /// the configured port. No keepalive, no body — just status line + a few
 /// headers. Pingora is already serving on https_port; this is the matching
 /// plain-HTTP companion that ensures `http://example.com/x` doesn't dead-end.
-async fn run_https_redirect(addr: &str, https_port: u16) -> anyhow::Result<()> {
+async fn run_https_redirect(
+    addr: &str,
+    https_port: u16,
+    challenges: Option<crate::acme::ChallengeMap>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind HTTPS redirect on {}: {}", addr, e))?;
@@ -229,8 +239,9 @@ async fn run_https_redirect(addr: &str, https_port: u16) -> anyhow::Result<()> {
                 continue;
             }
         };
+        let challenges = challenges.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_redirect(&mut sock, https_port).await {
+            if let Err(e) = handle_redirect(&mut sock, https_port, challenges).await {
                 debug!("Redirect handler ({}) ended: {:#}", peer, e);
             }
         });
@@ -240,6 +251,7 @@ async fn run_https_redirect(addr: &str, https_port: u16) -> anyhow::Result<()> {
 async fn handle_redirect(
     sock: &mut tokio::net::TcpStream,
     https_port: u16,
+    challenges: Option<crate::acme::ChallengeMap>,
 ) -> anyhow::Result<()> {
     use tokio::time::{timeout, Duration};
 
@@ -268,6 +280,32 @@ async fn handle_redirect(
     let mut parts = request_line.split(' ');
     let _method = parts.next().unwrap_or("GET");
     let target = parts.next().unwrap_or("/");
+
+    // ACME HTTP-01: when a renewal is in flight, the challenges map holds
+    // `token → key_authorization`. Serve those before redirecting so LE's
+    // validator (which can't follow a 301 to HTTPS) gets the plaintext
+    // response it needs.
+    const ACME_PREFIX: &str = "/.well-known/acme-challenge/";
+    if let Some(token) = target.strip_prefix(ACME_PREFIX) {
+        if let Some(map) = &challenges {
+            if let Some(key_auth) = map.read().await.get(token).cloned() {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    key_auth.len(),
+                    key_auth
+                );
+                sock.write_all(resp.as_bytes()).await?;
+                sock.shutdown().await.ok();
+                return Ok(());
+            }
+        }
+        // Unknown token (or no ACME running) — 404 rather than redirecting
+        // an ACME validator into HTTPS, which it won't follow.
+        let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        sock.write_all(resp).await?;
+        sock.shutdown().await.ok();
+        return Ok(());
+    }
 
     // Find Host header
     let mut host_value: Option<&str> = None;

@@ -266,6 +266,36 @@ pub struct ServerConfig {
     /// Admin panel basic auth password (optional). Ignored unless admin_user is also set.
     #[serde(default)]
     pub admin_password: Option<String>,
+    /// Optional ACME / Let's Encrypt configuration. When `acme.enabled = true`,
+    /// `kdcts` auto-issues and renews a certificate for `domain` and ignores any
+    /// manually configured `tls_cert_path` / `tls_key_path`.
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+}
+
+/// ACME (Let's Encrypt) auto-TLS configuration.
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Account email registered with the ACME directory. Required when enabled.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Override the ACME directory URL. Defaults to LE production
+    /// (`https://acme-v02.api.letsencrypt.org/directory`) or LE staging when
+    /// `staging = true`.
+    #[serde(default)]
+    pub directory_url: Option<String>,
+    /// Use the Let's Encrypt staging directory (untrusted certs, no rate limits).
+    /// Useful for testing.
+    #[serde(default)]
+    pub staging: bool,
+    /// Where to persist account.json + cert.pem + key.pem. Defaults to
+    /// `kdct-state/acme/{domain}/`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
