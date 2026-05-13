@@ -24,7 +24,7 @@ pub async fn deploy_connection(
         .context("Connection not found")?;
 
     let bridge_id = conn_info["bridge_id"].as_i64().context("Bridge not assigned")?;
-    let image_id = conn_info["image_id"].as_i64().context("Image not assigned")?;
+    let _image_id = conn_info["image_id"].as_i64().context("Image not assigned")?;
     let node_id = conn_info["node_id"].as_i64().context("Node not assigned")?;
 
     let bridge_name = conn_info["bridge_name"].as_str().unwrap_or("").to_string();
@@ -123,7 +123,7 @@ pub async fn deploy_connection(
 
     // Builds can take a while — give it 11 minutes total.
     match time::timeout(Duration::from_secs(660), rx).await {
-        Ok(Ok(res)) => {}
+        Ok(Ok(_)) => {}
         Ok(Err(err_msg)) => {
             pending_docker.write().await.remove(&container_name);
             return Err(anyhow::anyhow!("{}", err_msg));
@@ -147,7 +147,7 @@ pub async fn deploy_connection(
                 table.set(path, server_port)?;
             }
         }
-        let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
+        let (shutdown_tx, _) = broadcast::channel::<bool>(1);
         let protocols = p.protocols.as_deref().unwrap_or("tcp");
         let has_tcp = protocols.split(',').any(|s| s.trim() == "tcp");
         let has_udp = protocols.split(',').any(|s| s.trim() == "udp");

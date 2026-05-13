@@ -1,4 +1,4 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TcpConfig, TransportConfig, TransportType};
+use crate::config::{ClientConfig, ClientServiceConfig, Config, TcpConfig, TransportConfig, TransportType};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{

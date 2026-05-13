@@ -588,7 +588,7 @@ pub async fn run_api(
                         let jobs = job_registry.clone();
                         let jid = job_id.clone();
                         handle.spawn(async move {
-                            let mut log_line = |line: &str| {
+                            let log_line = |line: &str| {
                                 if let Ok(mut j) = jobs.lock() { if let Some(job) = j.get_mut(&jid) { job.logs.push(line.to_string()); } }
                             };
                             log_line(&format!("Loading: {}", source));

@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection as SqlConnection, params};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use tracing::info;
 
 pub struct Database {
     conn: Mutex<SqlConnection>,
-    path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -22,7 +21,6 @@ pub struct ImageNode {
 #[derive(Debug, Clone)]
 pub struct BridgePort {
     pub id: i64,
-    pub bridge_id: i64,
     pub container_port: i64,
     pub mode: String,
     pub route_path: Option<String>,
@@ -55,7 +53,6 @@ impl Database {
             .context("Failed to set PRAGMA")?;
         let db = Database {
             conn: Mutex::new(conn),
-            path: path.to_string_lossy().to_string(),
         };
         db.migrate()?;
         info!("Database opened at {}", path.display());
@@ -273,24 +270,6 @@ impl Database {
         Ok(rows.next().transpose()?)
     }
 
-    pub fn get_image_by_id(&self, id: i64) -> Result<Option<ImageNode>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, source, source_type, status, created_at FROM image_nodes WHERE id=?1",
-        )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(ImageNode {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                source: row.get(2)?,
-                source_type: row.get(3)?,
-                status: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?;
-        Ok(rows.next().transpose()?)
-    }
-
     pub fn list_images(&self) -> Result<Vec<ImageNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -376,17 +355,16 @@ impl Database {
     pub fn get_bridge_ports(&self, bridge_id: i64) -> Result<Vec<BridgePort>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, bridge_id, container_port, mode, route_path, protocols, pool_port FROM bridge_ports WHERE bridge_id=?1 ORDER BY container_port",
+            "SELECT id, container_port, mode, route_path, protocols, pool_port FROM bridge_ports WHERE bridge_id=?1 ORDER BY container_port",
         )?;
         let rows = stmt.query_map(params![bridge_id], |row| {
             Ok(BridgePort {
                 id: row.get(0)?,
-                bridge_id: row.get(1)?,
-                container_port: row.get(2)?,
-                mode: row.get(3)?,
-                route_path: row.get(4)?,
-                protocols: row.get(5)?,
-                pool_port: row.get(6)?,
+                container_port: row.get(1)?,
+                mode: row.get(2)?,
+                route_path: row.get(3)?,
+                protocols: row.get(4)?,
+                pool_port: row.get(5)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)

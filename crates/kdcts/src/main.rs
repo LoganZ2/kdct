@@ -93,7 +93,7 @@ async fn check_docker() -> Result<()> {
 }
 
 async fn start_server(config_path: PathBuf) -> Result<()> {
-    fdlimit::raise_fd_limit();
+    let _ = fdlimit::raise_fd_limit();
     let config = Config::from_file(&config_path).await?;
     let server_config = config
         .server

@@ -39,7 +39,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     let config = Config::from_file(config_path).await?;
 
     // Raise `nofile` limit on linux and mac
-    fdlimit::raise_fd_limit();
+    let _ = fdlimit::raise_fd_limit();
 
     debug!("{:?}", config);
 

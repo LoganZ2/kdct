@@ -351,21 +351,6 @@ impl Config {
         Ok(())
     }
 
-    fn validate_transport_config(config: &TransportConfig, _is_server: bool) -> Result<()> {
-        config
-            .tcp
-            .proxy
-            .as_ref()
-            .map_or(Ok(()), |u| match u.scheme() {
-                "socks5" => Ok(()),
-                "http" => Ok(()),
-                _ => Err(anyhow!(format!("Unknown proxy scheme: {}", u.scheme()))),
-            })?;
-        match config.transport_type {
-            TransportType::Tcp => Ok(()),
-        }
-    }
-
     pub async fn from_file(path: &Path) -> Result<Config> {
         let s: String = fs::read_to_string(path)
             .await
