@@ -188,7 +188,7 @@ kdct/
 ## Caveats
 
 - **Panel has optional basic auth.** Set `admin_user` and `admin_password` in `server.toml` to protect `/admin/` with HTTP Basic Authentication. Not required, but recommended for production.
-- **One control channel per auth token.** Nodes are keyed by a stable per-machine UUID (assigned by the server, persisted at `~/.kdct/node_id` on the client), so two machines no longer collide on hostname. But the control-channel map is still keyed by the auth token's digest — two clients using the same token will keep evicting each other. Give each client its own token (or its own `[client.services.*]` name) if you want them both online.
+- **Nodes are keyed by stable per-machine UUID.** Assigned by the server on first connect, persisted at `~/.kdct/node_id` on the client (0o600). Two machines sharing one auth token coexist — each gets its own uuid. A client that loses its `node_id` file recovers the same uuid only when the auth token is otherwise unused; with multiple machines on one token the recovery is ambiguous, so a fresh uuid is assigned and the orphan row stays in the DB until you delete it from the panel. A client trying to claim a uuid bound to a *different* auth token gets rejected.
 - **No HTTP→HTTPS redirect.** TLS-on means HTTP is gone; if you want both, terminate elsewhere.
 
 ## License
