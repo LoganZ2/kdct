@@ -69,8 +69,11 @@ pub enum ControlChannelCmd {
     },
 
     // ── Node status ──────────────────────────────────────────
-    /// Client → Server: Node info + available ports reported on connect/reconnect
+    /// Client → Server: Node info + available ports reported on connect/reconnect.
+    /// `node_uuid` is the client's persisted per-machine identifier; `None` means
+    /// "I don't have one yet, please assign me one".
     ReportNodeStatus {
+        node_uuid: Option<String>,
         hostname: String,
         os: String,
         arch: String,
@@ -80,6 +83,14 @@ pub enum ControlChannelCmd {
         cpu_cores: u32,
         memory_mb: u64,
         running_containers: Vec<ContainerInfo>,
+    },
+
+    // ── Identity assignment ──────────────────────────────────
+    /// Server → Client: assigns a UUID to a client that connected without one.
+    /// The client must persist this and send it as `node_uuid` on every future
+    /// `ReportNodeStatus`.
+    AssignNodeUuid {
+        uuid: String,
     },
 
     // ── Image / Container lifecycle (Server → Client) ─────────

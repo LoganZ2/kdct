@@ -83,15 +83,12 @@ pub async fn deploy_connection(
     let safe_name = connection_name.replace(['/', ':'], "-");
     let container_name = format!("kdct-{}-{}", safe_name, connection_id);
 
-    let (node_digest, cmd_tx, pending_docker, data_ch_req_tx, port_data_callbacks) = {
+    let (cmd_tx, pending_docker, data_ch_req_tx, port_data_callbacks) = {
         let guard = registry.read().await;
-        let digest = guard.iter()
-            .find(|(_, v)| v.hostname == node.hostname)
-            .map(|(k, _)| hex::encode(k));
-        let entry = guard.values()
-            .find(|e| e.hostname == node.hostname)
-            .context(format!("Client '{}' not found in registry", node.hostname))?;
-        (digest, entry.cmd_tx.clone(), entry.pending_docker.clone(),
+        let entry = guard.get(&node.node_uuid).context(format!(
+            "Client uuid={} ({}) not found in registry", node.node_uuid, node.hostname
+        ))?;
+        (entry.cmd_tx.clone(), entry.pending_docker.clone(),
          entry.data_ch_req_tx.clone(), entry.port_data_callbacks.clone())
     };
 
@@ -137,11 +134,9 @@ pub async fn deploy_connection(
         }
     };
 
-    if let Some(digest) = node_digest {
-        crate::deployment_tracker::record_deployment(
-            tracker, &connection_name, &container_name, &digest, server_ports.clone(),
-        ).await;
-    }
+    crate::deployment_tracker::record_deployment(
+        tracker, &connection_name, &container_name, &node.node_uuid, server_ports.clone(),
+    ).await;
 
     // Register routes + spawn accept loops
     let mut table = route_table.write().await;
@@ -203,35 +198,31 @@ pub async fn stop_connection(
     }
 
     // Try to send ImageStop if node is still online
-    if let Some(nid) = node_id {
-        if let Ok(Some(node)) = db.get_node_by_id(nid) {
-            let guard = registry.read().await;
-            let node_digest = guard.iter()
-                .find(|(_, v)| v.hostname == node.hostname)
-                .map(|(k, _)| hex::encode(k));
-            if let Some(entry) = guard.values().find(|e| e.hostname == node.hostname) {
-                let cmd_tx = entry.cmd_tx.clone();
-                let pending_docker = entry.pending_docker.clone();
-                drop(guard);
+    let node_uuid_opt: Option<String> = node_id
+        .and_then(|nid| db.get_node_by_id(nid).ok().flatten())
+        .map(|n| n.node_uuid);
+    if let Some(node_uuid) = node_uuid_opt.as_deref() {
+        let guard = registry.read().await;
+        if let Some(entry) = guard.get(node_uuid) {
+            let cmd_tx = entry.cmd_tx.clone();
+            let pending_docker = entry.pending_docker.clone();
+            drop(guard);
 
-                let (tx, rx) = oneshot::channel::<Result<Vec<u16>, String>>();
-                {
-                    let mut pending = pending_docker.write().await;
-                    pending.insert(container_name.clone(), tx);
-                }
-                let _ = cmd_tx.send(ControlChannelCmd::ImageStop {
-                    container_name: container_name.clone(),
-                }).await;
-                let _ = time::timeout(Duration::from_secs(30), rx).await;
+            let (tx, rx) = oneshot::channel::<Result<Vec<u16>, String>>();
+            {
+                let mut pending = pending_docker.write().await;
+                pending.insert(container_name.clone(), tx);
             }
+            let _ = cmd_tx.send(ControlChannelCmd::ImageStop {
+                container_name: container_name.clone(),
+            }).await;
+            let _ = time::timeout(Duration::from_secs(30), rx).await;
         }
     }
 
     // Clean up routes + pool ports
-    if let Some(digest_hex) = node_id.and_then(|nid| {
-        db.get_node_by_id(nid).ok().flatten().and_then(|n| n.auth_digest)
-    }) {
-        if let Some(deployment) = crate::deployment_tracker::get_deployment(tracker, &connection_name, &digest_hex).await {
+    if let Some(node_uuid) = node_uuid_opt.as_deref() {
+        if let Some(deployment) = crate::deployment_tracker::get_deployment(tracker, &connection_name, node_uuid).await {
             let mut table = route_table.write().await;
             for port in &deployment.server_ports {
                 table.remove_by_port(*port);
@@ -244,7 +235,7 @@ pub async fn stop_connection(
                 if deployment.server_ports.contains(sp) { let _ = tx.send(true); false } else { true }
             });
 
-            crate::deployment_tracker::remove_deployment(tracker, &connection_name, &digest_hex).await;
+            crate::deployment_tracker::remove_deployment(tracker, &connection_name, node_uuid).await;
         }
     }
 
