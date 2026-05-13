@@ -118,9 +118,23 @@ KDCT splits a deployment into three reusable pieces, joined by a connection:
 
 ## TLS
 
-Requires `domain` plus `tls_cert_path` and `tls_key_path` pointing at a real cert and key. When all three are present, the **TLS toggle** in the panel's settings becomes available. Flip it on, restart `kdcts`, done. Pingora binds either `http_port` or `https_port`, never both — there's no mixed-mode and no auto-redirect. Front with Caddy/nginx if you need one.
+Two ways to get a cert:
 
-No ACME / Let's Encrypt automation; bring your own cert.
+**1. Auto (Let's Encrypt).** Add `[server.acme]`:
+
+```toml
+[server.acme]
+enabled = true
+email   = "you@example.com"
+# staging = true               # use LE staging while testing
+# state_dir = "kdct-state/acme/your.domain"
+```
+
+`kdcts` issues a cert via HTTP-01 on startup, persists it under `state_dir`, flips the TLS toggle on, and renews automatically when fewer than 30 days remain (Pingora picks the new cert up on next restart). `domain` is required, and `http_port` must be reachable from the public internet for the challenge.
+
+**2. Manual.** Set `tls_cert_path` and `tls_key_path` in `[server]`. Flip the TLS toggle in the panel. Restart `kdcts`.
+
+Either way, when TLS is on `kdcts` binds HTTPS on `https_port`, the panel TLS toggle becomes available, and `http_port` is left for `acme` renewals (and a future HTTP→HTTPS redirector). Pingora itself only ever speaks one of the two.
 
 ## Reserved paths
 

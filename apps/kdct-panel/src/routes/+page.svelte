@@ -19,7 +19,28 @@
 
   let expandedBridge = $state<number | null>(null);
 
+  // ACME form is separate from `settings.acme_*` so the 5s poll can't stomp
+  // user edits, and so we can show a "dirty" indicator. `acmeServer` is the
+  // last value we saw from the server; `acmeDraft` is what the user is
+  // editing. They diverge while the user has unsaved changes.
+  type AcmeState = { enabled: boolean; email: string; staging: boolean };
+  let acmeServer = $state<AcmeState>({ enabled: false, email: '', staging: false });
+  let acmeDraft = $state<AcmeState>({ enabled: false, email: '', staging: false });
+  let acmeDirty = $derived(
+    acmeDraft.enabled !== acmeServer.enabled ||
+    acmeDraft.email !== acmeServer.email ||
+    acmeDraft.staging !== acmeServer.staging,
+  );
+
   let timer: any = null;
+
+  function acmeFromSettings(st: any): AcmeState {
+    return {
+      enabled: !!st?.acme_enabled,
+      email: st?.acme_email ?? '',
+      staging: !!st?.acme_staging,
+    };
+  }
 
   async function refresh() {
     try {
@@ -32,6 +53,11 @@
         fetch(`${base}/api/settings`).then(r => r.json()),
       ]);
       overview = ov; images = im; nodes = nd; bridges = br; connections = cn; settings = st; err = '';
+      const next = acmeFromSettings(st);
+      // Only re-seed the draft when the user has no unsaved edits — that
+      // way the 5s poll never overwrites what they're typing.
+      if (!acmeDirty) acmeDraft = { ...next };
+      acmeServer = next;
     } catch { err = 'Cannot reach kdct server'; }
   }
 
@@ -50,10 +76,33 @@
       if (!res.ok) {
         const e = await res.json().catch(() => ({}));
         alert(e.error || `Failed to update TLS setting (${res.status})`);
+      }
+    } catch { alert('Failed to update TLS setting'); }
+  }
+
+  async function saveAcme() {
+    // Snapshot the values we're sending so a mid-flight poll doesn't
+    // confuse the dirty check after we update acmeServer below.
+    const payload = { ...acmeDraft };
+    try {
+      const res = await fetch(`${base}/api/settings/acme`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        alert(e.error || `Failed to save ACME settings (${res.status})`);
         return;
       }
-      refresh();
-    } catch { alert('Failed to update TLS setting'); }
+      // Server will exec() in ~500ms. Mark the form clean so the spinner
+      // doesn't keep showing "unsaved" while we wait for it to come back.
+      acmeServer = { ...payload };
+    } catch {
+      // Connection dropped — most likely the server is mid-restart.
+      // autoCheck() will reconnect and re-sync.
+      acmeServer = { ...payload };
+    }
   }
 
   onMount(() => { refresh(); timer = setInterval(autoCheck, 5000); });
@@ -277,6 +326,39 @@
         {#if settings.restart_required}
           <div class="msg warn">Restart <code>kdcts</code> to apply: persisted TLS = {settings.tls_enabled}, live = {settings.live_tls_enabled}.</div>
         {/if}
+
+        <!-- ACME / Let's Encrypt -->
+        <div class="setting-row" style="border-top:1px solid var(--border);margin-top:12px;padding-top:16px">
+          <div>
+            <div class="setting-title">Auto TLS (Let's Encrypt)</div>
+            <div class="dim" style="font-size:11px">
+              Automatically issue and renew a free TLS certificate for <code>{settings.domain_configured ? 'your domain' : '(set domain first)'}</code>. Requires <code>domain</code> in server.toml and port 80 reachable from the internet.
+            </div>
+            {#if acmeDraft.enabled}
+              <div class="field" style="margin-top:8px">
+                <input class="input" type="email" placeholder="you@example.com" bind:value={acmeDraft.email} style="width:240px;font-size:12px" />
+              </div>
+              <div style="margin-top:6px;font-size:11px">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                  <input type="checkbox" bind:checked={acmeDraft.staging} />
+                  <span class="dim">Use staging environment (for testing — untrusted certs, no rate limits)</span>
+                </label>
+              </div>
+            {/if}
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+            <label class="switch">
+              <input type="checkbox" bind:checked={acmeDraft.enabled} />
+              <span class="slider"></span>
+            </label>
+            {#if acmeDirty}
+              <button class="ghost small" onclick={saveAcme} disabled={acmeDraft.enabled && !acmeDraft.email.trim()}>
+                {acmeDraft.enabled ? 'Save & Restart' : 'Disable & Restart'}
+              </button>
+            {/if}
+          </div>
+        </div>
+
         <div class="setting-meta">
           <div><span class="dim">Public HTTP port</span><span class="mono">{settings.http_port}</span></div>
           <div><span class="dim">Public HTTPS port</span><span class="mono">{settings.https_port}</span></div>

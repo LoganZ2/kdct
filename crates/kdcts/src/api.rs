@@ -439,7 +439,7 @@ pub async fn run_api(
 
                 (&tiny_http::Method::Get, "/api/ping") => { respond_json(&json!({"ok": true})) }
 
-                // ── Settings (TLS toggle, ports) ─────────────────
+                // ── Settings (TLS toggle, ports, ACME) ──────────────
                 (&tiny_http::Method::Get, "/api/settings") => {
                     let persisted_tls = db
                         .get_setting("tls_enabled")
@@ -447,6 +447,10 @@ pub async fn run_api(
                         .flatten()
                         .map(|v| v == "true")
                         .unwrap_or(false);
+                    let acme_enabled = db.get_setting("acme_enabled").ok().flatten().map(|v| v == "true").unwrap_or(false);
+                    let acme_email = db.get_setting("acme_email").ok().flatten();
+                    let acme_staging = db.get_setting("acme_staging").ok().flatten().map(|v| v == "true").unwrap_or(false);
+                    let acme_state_dir = db.get_setting("acme_state_dir").ok().flatten();
                     respond_json(&json!({
                         "tls_enabled": persisted_tls,
                         "live_tls_enabled": settings.live_tls_enabled,
@@ -456,6 +460,10 @@ pub async fn run_api(
                         "http_port": settings.http_port,
                         "https_port": settings.https_port,
                         "api_port": settings.api_port,
+                        "acme_enabled": acme_enabled,
+                        "acme_email": acme_email,
+                        "acme_staging": acme_staging,
+                        "acme_state_dir": acme_state_dir,
                     }))
                 }
 
@@ -487,14 +495,44 @@ pub async fn run_api(
                         match db.set_setting("tls_enabled", value) {
                             Ok(_) => {
                                 let restart_required = want_tls != settings.live_tls_enabled;
-                                respond_json(&json!({
+                                let result = respond_json(&json!({
                                     "ok": true,
                                     "tls_enabled": want_tls,
                                     "restart_required": restart_required,
-                                }))
+                                }));
+                                if restart_required {
+                                    crate::delayed_restart();
+                                }
+                                result
                             }
                             Err(e) => error_json(&format!("{}", e), 500),
                         }
+                    })()
+                }
+
+                // ── ACME settings ─────────────────────────────────
+                (&tiny_http::Method::Post, "/api/settings/acme") => {
+                    (|| {
+                        let mut body = String::new();
+                        if request.as_reader().read_to_string(&mut body).is_err() {
+                            return error_json("Failed to read body", 400);
+                        }
+                        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                            Ok(v) => v,
+                            Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+                        };
+                        if let Some(enabled) = parsed.get("enabled").and_then(|v| v.as_bool()) {
+                            let _ = db.set_setting("acme_enabled", if enabled { "true" } else { "false" });
+                        }
+                        if let Some(email) = parsed.get("email").and_then(|v| v.as_str()) {
+                            let _ = db.set_setting("acme_email", email.trim());
+                        }
+                        if let Some(staging) = parsed.get("staging").and_then(|v| v.as_bool()) {
+                            let _ = db.set_setting("acme_staging", if staging { "true" } else { "false" });
+                        }
+                        let result = respond_json(&json!({"ok": true}));
+                        crate::delayed_restart();
+                        result
                     })()
                 }
 

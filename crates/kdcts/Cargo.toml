@@ -23,3 +23,5 @@ base64 = "0.22"
 ureq = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 uuid = { version = "1", features = ["v4"] }
+instant-acme = { version = "0.8", features = ["rcgen"] }
+x509-parser = "0.18"
