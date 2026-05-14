@@ -56,7 +56,14 @@ pub struct ClientServiceConfig {
     pub service_type: ServiceType,
     #[serde(skip)]
     pub name: String,
-    pub local_addr: String,
+    /// Fallback target for traffic that arrives without a per-connection port
+    /// hint — i.e. the server's `StartForwardTcp(None)` and `StartForwardUdp`
+    /// paths. In normal kdct container mode the server always sends a
+    /// specific port (`StartForwardTcp(Some(port))`), so this can be left
+    /// unset. Only set it if you're using kdctc as a plain TCP/UDP tunnel
+    /// for a single local service.
+    #[serde(default)]
+    pub local_addr: Option<String>,
     #[serde(default)] // Default to false
     pub prefer_ipv6: bool,
     pub token: Option<MaskedString>,
@@ -81,7 +88,7 @@ impl Default for ClientServiceConfig {
         ClientServiceConfig {
             service_type: ServiceType::Tcp,
             name: String::new(),
-            local_addr: String::new(),
+            local_addr: None,
             prefer_ipv6: false,
             token: None,
             nodelay: None,

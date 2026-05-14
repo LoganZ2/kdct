@@ -69,8 +69,6 @@ remote_addr   = "VPS_IP:2333"
 default_token = "change-me"
 
 [client.services.my-node]
-type             = "tcp"
-local_addr       = "127.0.0.1:3000"
 port_range_start = 3000                  # required
 port_range_end   = 3999                  # required
 # image_cache_ttl_seconds = 300          # default 5 min

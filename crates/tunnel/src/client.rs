@@ -262,12 +262,25 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
         DataChannelCmd::StartForwardTcp(local_port) => {
             let addr = match local_port {
                 Some(port) => format!("127.0.0.1:{}", port),
-                None => args.service.local_addr.clone(),
+                None => args.service.local_addr.clone().ok_or_else(|| {
+                    anyhow!(
+                        "Server requested forwarding without a port and no `local_addr` is set \
+                         on [client.services.{}]",
+                        args.service.name
+                    )
+                })?,
             };
             run_data_channel_for_tcp::<T>(conn, &addr).await?;
         }
         DataChannelCmd::StartForwardUdp => {
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            let addr = args.service.local_addr.clone().ok_or_else(|| {
+                anyhow!(
+                    "Server requested UDP forwarding but no `local_addr` is set on \
+                     [client.services.{}]",
+                    args.service.name
+                )
+            })?;
+            run_data_channel_for_udp::<T>(conn, &addr, args.service.prefer_ipv6).await?;
         }
     }
     Ok(())

@@ -1,9 +1,16 @@
+# kdctc — client config.
+#
+# Point `remote_addr` at the VPS running `kdcts` (the tunnel listener — the
+# port set as `bind_addr` in server.toml, default 2333). `default_token`
+# must match server.toml. One `[client.services.*]` block is required;
+# `port_range_start`/`port_range_end` is the range Docker can use for
+# container ports.
+
 [client]
-remote_addr = "127.0.0.1:2333"
-default_token = "test-token-123"
+remote_addr   = "VPS_IP:2333"
+default_token = "change-me"
 
 [client.services.my-node]
-type = "tcp"
-local_addr = "127.0.0.1:3000"
 port_range_start = 3000
-port_range_end = 3999
+port_range_end   = 3999
+# image_cache_ttl_seconds = 300   # default 5 min
