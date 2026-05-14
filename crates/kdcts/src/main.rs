@@ -127,17 +127,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     // domain needs to be reread now that we may have overridden it.
     let domain = server_config.domain.as_ref().cloned();
 
-    // First-run setup is "complete" when the operator either ran the
-    // wizard (which sets the flag) OR provided a token in server.toml
-    // directly. Without a token kdcts can't accept tunnel connections,
-    // so it always runs in setup mode until one is set.
-    let setup_complete = db
-        .get_setting("setup_complete")
-        .ok()
-        .flatten()
-        .map(|v| v == "true")
-        .unwrap_or(false)
-        || server_config.default_token.is_some();
+    // First-run setup is "complete" when a token is configured — either
+    // in server.toml directly or stored by the wizard in the DB (already
+    // overlaid above). Without a token kdcts can't accept tunnel
+    // connections, so it always runs in setup mode until one is set.
+    // No persisted flag — the check is purely "scan config, decide".
+    let setup_complete = server_config.default_token.is_some();
     if !setup_complete {
         tracing::warn!("");
         tracing::warn!("  ╔══════════════════════════════════════════════════════════════════╗");

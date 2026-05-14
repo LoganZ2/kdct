@@ -986,7 +986,6 @@ fn handle_setup_request(
             if let Some(b) = parsed.get("acme_staging").and_then(|v| v.as_bool()) {
                 set("acme_staging", if b { "true" } else { "false" });
             }
-            set("setup_complete", "true");
             let resp = respond_json(&json!({"ok": true}));
             crate::delayed_restart();
             resp
