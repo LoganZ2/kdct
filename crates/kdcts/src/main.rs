@@ -6,7 +6,7 @@ mod deployment_tracker;
 mod image;
 mod proxy;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Parser;
 use tunnel::config::{Config, TransportType};
 use tunnel::port_pool::PortPool;
@@ -66,30 +66,10 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    check_docker().await?;
-
     let args = Args::parse();
     start_server(args.config).await?;
 
     Ok(())
-}
-
-async fn check_docker() -> Result<()> {
-    let output = std::process::Command::new("docker")
-        .arg("--version")
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::info!(
-                "Docker detected: {}",
-                String::from_utf8_lossy(&o.stdout).trim()
-            );
-            Ok(())
-        }
-        _ => {
-            bail!("Docker is not installed or not in PATH. Please install Docker first.")
-        }
-    }
 }
 
 async fn start_server(config_path: PathBuf) -> Result<()> {
