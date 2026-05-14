@@ -8,13 +8,26 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-/// Path prefix reserved for the admin panel + REST API.
-/// Bridges may not use route paths under this prefix.
+/// Path prefixes reserved for the panel: `/admin` for the real panel and
+/// `/setup` for the first-run wizard. Bridges may not use route paths
+/// under either prefix. Both are forwarded to the internal API server.
 pub const ADMIN_PREFIX: &str = "/admin";
+pub const SETUP_PREFIX: &str = "/setup";
 
 /// True if `path` falls under the reserved `/admin` prefix.
 pub fn is_admin_path(path: &str) -> bool {
     path == ADMIN_PREFIX || path.starts_with("/admin/")
+}
+
+/// True if `path` falls under the reserved `/setup` prefix.
+pub fn is_setup_path(path: &str) -> bool {
+    path == SETUP_PREFIX || path.starts_with("/setup/")
+}
+
+/// True if `path` is in either reserved prefix — i.e. it should be
+/// forwarded to the internal API server rather than a tunnel.
+pub fn is_panel_path(path: &str) -> bool {
+    is_admin_path(path) || is_setup_path(path)
 }
 
 /// RouteTable maps path → localhost port (tunnel endpoint).
@@ -29,8 +42,8 @@ impl RouteTable {
     }
 
     pub fn set(&mut self, path: &str, port: u16) -> anyhow::Result<()> {
-        if is_admin_path(path) {
-            anyhow::bail!("Path '{}' is reserved for the admin panel", path);
+        if is_panel_path(path) {
+            anyhow::bail!("Path '{}' is reserved (/admin and /setup are panel-only)", path);
         }
         if self.routes.contains_key(path) {
             anyhow::bail!("Path '{}' is already in use", path);
@@ -112,9 +125,9 @@ impl ProxyHttp for KdctProxy {
         // pick something stable.
         let upstream_sni = self.domain.clone().unwrap_or_else(|| host.clone());
 
-        // Reserved /admin prefix → forward to the panel API
-        if is_admin_path(path) {
-            info!("Proxy: {} → admin panel (127.0.0.1:{})", path, self.api_port);
+        // Reserved /admin or /setup prefix → forward to the panel API
+        if is_panel_path(path) {
+            info!("Proxy: {} → panel (127.0.0.1:{})", path, self.api_port);
             let peer = Box::new(HttpPeer::new(
                 ("127.0.0.1", self.api_port),
                 false,

@@ -238,7 +238,12 @@ fn default_api_port() -> u16 {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub default_token: MaskedString,
+    /// Shared secret clients must present to open a control channel. Optional
+    /// in the file so kdcts can boot into setup mode with no token — the
+    /// admin wizard at `/setup` then fills it in. The DB-stored value (set
+    /// by the wizard) overrides this if both are present.
+    #[serde(default)]
+    pub default_token: Option<MaskedString>,
     #[serde(default)]
     pub services: HashMap<String, ServerServiceConfig>,
     #[serde(default)]
@@ -336,7 +341,7 @@ impl Config {
         for (name, s) in &mut server.services {
             s.name = name.clone();
             if s.token.is_none() {
-                s.token = Some(server.default_token.clone());
+                s.token = server.default_token.clone();
             }
         }
 
@@ -390,7 +395,7 @@ mod tests {
         );
 
         // Default token fills missing service token
-        cfg.default_token = "123".into();
+        cfg.default_token = Some("123".into());
         assert!(Config::validate_server_config(&mut cfg).is_ok());
         assert_eq!(
             cfg.services
@@ -430,7 +435,7 @@ mod tests {
             ClientServiceConfig {
                 service_type: ServiceType::Tcp,
                 name: "foo1".into(),
-                local_addr: "127.0.0.1:80".into(),
+                local_addr: Some("127.0.0.1:80".into()),
                 token: None,
                 ..Default::default()
             },

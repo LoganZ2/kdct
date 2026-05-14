@@ -40,6 +40,10 @@ pub struct ApiSettings {
     pub admin_user: Option<String>,
     /// Admin basic auth password (optional).
     pub admin_password: Option<String>,
+    /// First-run setup has been completed. When false, `/admin/*` returns
+    /// a stub pointing the operator at `/setup`, the wizard is served at
+    /// `/setup`, and the API's setup endpoints accept POSTs.
+    pub setup_complete: bool,
 }
 
 #[derive(Clone)]
@@ -104,9 +108,13 @@ pub async fn run_api(
             let raw_path = request.url().to_string();
             let method = request.method();
             let raw_path_no_query = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
-            // Requests forwarded by Pingora arrive with the /admin prefix; strip it
-            // so internal route matching stays prefix-agnostic.
+            // Requests forwarded by Pingora arrive with the /admin or
+            // /setup prefix; strip /admin/ so internal route matching stays
+            // prefix-agnostic. /setup paths are matched whole because they
+            // get special handling outside the prefix-agnostic table.
             let was_admin = raw_path_no_query == "/admin" || raw_path_no_query.starts_with("/admin/");
+            let is_setup_path = raw_path_no_query == "/setup"
+                || raw_path_no_query.starts_with("/setup/");
             let path = if let Some(rest) = raw_path_no_query.strip_prefix("/admin/") {
                 format!("/{}", rest)
             } else if raw_path_no_query == "/admin" {
@@ -116,15 +124,50 @@ pub async fn run_api(
             };
             let handle = Handle::current();
 
-            // Basic auth check (when configured)
-            if let (Some(user), Some(pass)) = (&settings.admin_user, &settings.admin_password) {
-                if !check_basic_auth(&request, user, pass) {
-                    let resp = tiny_http::Response::from_string("Unauthorized")
-                        .with_status_code(tiny_http::StatusCode(401))
-                        .with_header(tiny_http::Header::from_bytes("WWW-Authenticate", "Basic realm=\"KDCT\"").unwrap());
-                    if let Err(e) = request.respond(resp) { error!("Failed to send 401: {}", e); }
-                    continue;
+            // Setup mode: when the wizard hasn't been completed, /admin/*
+            // returns a stub pointing the operator at /setup. The wizard
+            // itself is accessible without basic auth (the credentials
+            // haven't been set yet).
+            if was_admin && !settings.setup_complete {
+                let body = SETUP_REQUIRED_STUB.replace(
+                    "{{HTTP_PORT}}",
+                    &settings.http_port.to_string(),
+                );
+                let resp = tiny_http::Response::from_string(body)
+                    .with_status_code(503)
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8")
+                            .unwrap(),
+                    );
+                if let Err(e) = request.respond(resp) {
+                    error!("Failed to send setup stub: {}", e);
                 }
+                continue;
+            }
+
+            // Basic auth check (when configured) — skipped for /setup so
+            // operators who haven't finished the wizard can still reach it.
+            if !is_setup_path {
+                if let (Some(user), Some(pass)) = (&settings.admin_user, &settings.admin_password) {
+                    if !check_basic_auth(&request, user, pass) {
+                        let resp = tiny_http::Response::from_string("Unauthorized")
+                            .with_status_code(tiny_http::StatusCode(401))
+                            .with_header(tiny_http::Header::from_bytes("WWW-Authenticate", "Basic realm=\"KDCT\"").unwrap());
+                        if let Err(e) = request.respond(resp) { error!("Failed to send 401: {}", e); }
+                        continue;
+                    }
+                }
+            }
+
+            // Short-circuit setup endpoints before falling into the main
+            // admin-panel match. Three routes: the wizard HTML, the
+            // prefill GET, and the save POST.
+            if is_setup_path {
+                let resp = handle_setup_request(&mut request, &db, &settings, &raw_path_no_query);
+                if let Err(e) = request.respond(resp) {
+                    error!("Failed to send setup response: {}", e);
+                }
+                continue;
             }
 
             let response = match (method, path.as_str()) {
@@ -858,4 +901,96 @@ fn check_basic_auth(request: &tiny_http::Request, user: &str, pass: &str) -> boo
     let got_user = parts.next().unwrap_or("");
     let got_pass = parts.next().unwrap_or("");
     got_user == user && got_pass == pass
+}
+
+// ── Setup wizard ──────────────────────────────────────────────────────
+
+/// Stub served at /admin/* when setup hasn't been completed. Points the
+/// operator at /setup, where the wizard lives.
+const SETUP_REQUIRED_STUB: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>kdct — setup required</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background:#111; color:#ddd; padding:48px; max-width:640px; margin:auto; }
+  h1 { color:#fff; }
+  a { color:#7fbfff; }
+  code { background:#222; padding:2px 6px; border-radius:3px; }
+</style></head><body>
+<h1>kdct — setup required</h1>
+<p>The admin panel isn't available until first-run setup is complete.</p>
+<p>Open <a href="/setup"><code>/setup</code></a> to configure kdcts.</p>
+</body></html>"#;
+
+/// Render the wizard. Form fields are populated from the
+/// `server_config` table via /setup/api/setup (GET).
+const SETUP_WIZARD_HTML: &str = include_str!("setup.html");
+
+fn handle_setup_request(
+    request: &mut tiny_http::Request,
+    db: &Database,
+    _settings: &ApiSettings,
+    raw_path: &str,
+) -> tiny_http::Response<Cursor<Vec<u8>>> {
+    let method = request.method().clone();
+    match (method, raw_path) {
+        (tiny_http::Method::Get | tiny_http::Method::Head, "/setup")
+        | (tiny_http::Method::Get | tiny_http::Method::Head, "/setup/") => {
+            tiny_http::Response::from_string(SETUP_WIZARD_HTML)
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "text/html; charset=utf-8")
+                        .unwrap(),
+                )
+        }
+        (tiny_http::Method::Get, "/setup/api/setup") => {
+            let g = |k: &str| db.get_setting(k).ok().flatten().unwrap_or_default();
+            respond_json(&json!({
+                "domain":             g("setup_domain"),
+                "token":              g("setup_token"),
+                "admin_user":         g("setup_admin_user"),
+                "admin_password":     g("setup_admin_password"),
+                "tls_cert_path":      g("setup_tls_cert_path"),
+                "tls_key_path":       g("setup_tls_key_path"),
+                "acme_enabled":       g("acme_enabled") == "true",
+                "acme_email":         g("acme_email"),
+                "acme_staging":       g("acme_staging") == "true",
+            }))
+        }
+        (tiny_http::Method::Post, "/setup/api/setup") => {
+            let mut body = String::new();
+            if request.as_reader().read_to_string(&mut body).is_err() {
+                return error_json("Failed to read body", 400);
+            }
+            let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => return error_json(&format!("Invalid JSON: {}", e), 400),
+            };
+            let token = parsed.get("token").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if token.is_empty() {
+                return error_json("Auth token is required", 400);
+            }
+            let set = |k: &str, val: &str| {
+                let _ = db.set_setting(k, val);
+            };
+            set("setup_token",          token);
+            set("setup_domain",         parsed.get("domain").and_then(|v| v.as_str()).unwrap_or("").trim());
+            set("setup_admin_user",     parsed.get("admin_user").and_then(|v| v.as_str()).unwrap_or("").trim());
+            set("setup_admin_password", parsed.get("admin_password").and_then(|v| v.as_str()).unwrap_or(""));
+            set("setup_tls_cert_path",  parsed.get("tls_cert_path").and_then(|v| v.as_str()).unwrap_or("").trim());
+            set("setup_tls_key_path",   parsed.get("tls_key_path").and_then(|v| v.as_str()).unwrap_or("").trim());
+            // ACME settings flow into the same keys the panel already uses.
+            if let Some(b) = parsed.get("acme_enabled").and_then(|v| v.as_bool()) {
+                set("acme_enabled", if b { "true" } else { "false" });
+            }
+            set("acme_email",   parsed.get("acme_email").and_then(|v| v.as_str()).unwrap_or("").trim());
+            if let Some(b) = parsed.get("acme_staging").and_then(|v| v.as_bool()) {
+                set("acme_staging", if b { "true" } else { "false" });
+            }
+            set("setup_complete", "true");
+            let resp = respond_json(&json!({"ok": true}));
+            crate::delayed_restart();
+            resp
+        }
+        _ => error_json("Not found", 404),
+    }
 }

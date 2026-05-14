@@ -249,8 +249,14 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     );
     protocol::write_hello(&mut conn, &hello_send).await?;
 
-    // Token-only auth: use global default_token, no service lookup
-    let mut concat = Vec::from(server_config.default_token.as_bytes());
+    // Token-only auth: use global default_token, no service lookup.
+    // No token configured at all means we're in setup mode and the tunnel
+    // shouldn't be listening — but bail cleanly if a connection does get in.
+    let token = server_config
+        .default_token
+        .as_ref()
+        .ok_or_else(|| anyhow!("Server is in setup mode (no default_token); rejecting handshake"))?;
+    let mut concat = Vec::from(token.as_bytes());
     concat.append(&mut nonce);
 
     let protocol::Auth(d) = read_auth(&mut conn).await?;
@@ -282,7 +288,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         service_type: ServiceType::Tcp,
         name: service_name.clone(),
         bind_addr: "127.0.0.1:0".into(),
-        token: Some(server_config.default_token.clone()),
+        token: server_config.default_token.clone(),
         nodelay: None,
     };
 

@@ -79,11 +79,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         .server
         .ok_or_else(|| anyhow::anyhow!("Missing [server] section in config"))?;
 
-    // Domain is optional. When unset, the proxy accepts any Host header
-    // (like nginx with no `server_name`), so users can hit kdcts directly
-    // by IP. TLS is force-disabled in that mode because there's no name
-    // to put on a cert.
-    let domain = server_config.domain.as_ref().cloned();
+    // Domain is optional and may also be overridden from the DB below.
+    // When unset, the proxy accepts any Host header (like nginx with no
+    // `server_name`). TLS is force-disabled without one.
 
     let http_port = server_config.http_port;
     let https_port = server_config.https_port;
@@ -91,6 +89,64 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     let db_path = PathBuf::from("kdct.db");
 
     let db = Database::open(&db_path)?;
+
+    // Wizard-managed identity settings (default_token, domain, admin auth,
+    // TLS cert/key paths) live in `server_config` and override server.toml.
+    // Same precedence rule as ACME: anything the panel has written wins.
+    let mut server_config = server_config;
+    if let Ok(Some(v)) = db.get_setting("setup_token") {
+        if !v.is_empty() {
+            server_config.default_token = Some(v.as_str().into());
+        }
+    }
+    if let Ok(Some(v)) = db.get_setting("setup_domain") {
+        if !v.is_empty() {
+            server_config.domain = Some(v);
+        }
+    }
+    if let Ok(Some(v)) = db.get_setting("setup_admin_user") {
+        if !v.is_empty() {
+            server_config.admin_user = Some(v);
+        }
+    }
+    if let Ok(Some(v)) = db.get_setting("setup_admin_password") {
+        if !v.is_empty() {
+            server_config.admin_password = Some(v);
+        }
+    }
+    if let Ok(Some(v)) = db.get_setting("setup_tls_cert_path") {
+        if !v.is_empty() {
+            server_config.tls_cert_path = Some(v);
+        }
+    }
+    if let Ok(Some(v)) = db.get_setting("setup_tls_key_path") {
+        if !v.is_empty() {
+            server_config.tls_key_path = Some(v);
+        }
+    }
+    // domain needs to be reread now that we may have overridden it.
+    let domain = server_config.domain.as_ref().cloned();
+
+    // First-run setup is "complete" when the operator either ran the
+    // wizard (which sets the flag) OR provided a token in server.toml
+    // directly. Without a token kdcts can't accept tunnel connections,
+    // so it always runs in setup mode until one is set.
+    let setup_complete = db
+        .get_setting("setup_complete")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false)
+        || server_config.default_token.is_some();
+    if !setup_complete {
+        tracing::warn!("");
+        tracing::warn!("  ╔══════════════════════════════════════════════════════════════════╗");
+        tracing::warn!("  ║  SETUP REQUIRED                                                  ║");
+        tracing::warn!("  ║  kdcts is running in setup mode — no auth token is configured.   ║");
+        tracing::warn!("  ║  Open http://<this-host>:{:<5}/setup to finish configuration.    ║", http_port);
+        tracing::warn!("  ╚══════════════════════════════════════════════════════════════════╝");
+        tracing::warn!("");
+    }
 
     // ACME / Let's Encrypt auto-TLS. When enabled, replaces the manual
     // tls_cert_path / tls_key_path with files we manage under a state dir.
@@ -380,6 +436,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 api_port,
                 admin_user: server_config.admin_user.clone(),
                 admin_password: server_config.admin_password.clone(),
+                setup_complete,
             };
             tokio::spawn(async move {
                 if let Err(e) = api::run_api(
@@ -398,7 +455,20 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 }
             });
 
-            server.run(shutdown_rx).await?;
+            if setup_complete {
+                server.run(shutdown_rx).await?;
+            } else {
+                // Setup mode: keep the panel + API up but don't bind the
+                // tunnel listener. The wizard will exec-restart us once the
+                // operator clicks Save, and we'll come back through this
+                // branch with setup_complete=true.
+                tracing::info!(
+                    "Tunnel listener skipped (setup mode). Visit /setup to configure."
+                );
+                drop(server);
+                let mut rx = shutdown_rx;
+                let _ = rx.recv().await;
+            }
             drop(shutdown_tx);
             Ok(())
         }
